@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
+using Autodesk.AutoCAD.EditorInput;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.Gis.Map;
 using Autodesk.Gis.Map.ObjectData;
@@ -69,19 +70,14 @@ namespace AreaManager.Services
                     continue;
                 }
 
-                if (!table.HasObject(objectId))
-                {
-                    continue;
-                }
-
-                var records = table.GetObjectTableRecords(0, objectId, OpenMode.OpenForRead, false);
+                var records = table.GetObjectTableRecords(0, objectId, OpenMode.ForRead, false);
                 if (records.Count == 0)
                 {
                     continue;
                 }
 
                 var record = records[0];
-                var fieldIndex = record.Table.FieldDefinitions.FindField(WorkspaceFieldName);
+                var fieldIndex = table.FieldDefinitions.FindField(WorkspaceFieldName);
                 if (fieldIndex < 0)
                 {
                     continue;
