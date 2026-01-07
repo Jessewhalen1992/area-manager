@@ -47,7 +47,7 @@ namespace AreaManager.Services
                         continue;
                     }
 
-                    var blockName = blockReference.EffectiveName;
+                    var blockName = GetBlockName(transaction, blockReference);
                     if (!SupportedBlockNames.Contains(blockName))
                     {
                         continue;
@@ -90,6 +90,20 @@ namespace AreaManager.Services
             }
 
             return result;
+        }
+
+        private static string GetBlockName(Transaction transaction, BlockReference blockReference)
+        {
+            if (blockReference.IsDynamicBlock)
+            {
+                var record = transaction.GetObject(blockReference.DynamicBlockTableRecord, OpenMode.ForRead) as BlockTableRecord;
+                if (record != null)
+                {
+                    return record.Name;
+                }
+            }
+
+            return blockReference.Name;
         }
     }
 }

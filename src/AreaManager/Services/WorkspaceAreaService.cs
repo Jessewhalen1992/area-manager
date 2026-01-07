@@ -7,6 +7,7 @@ using Autodesk.AutoCAD.Geometry;
 using Autodesk.Gis.Map;
 using Autodesk.Gis.Map.ObjectData;
 using AreaManager.Models;
+using MapOpenMode = Autodesk.Gis.Map.Constants.OpenMode;
 
 namespace AreaManager.Services
 {
@@ -70,14 +71,14 @@ namespace AreaManager.Services
                     continue;
                 }
 
-                var records = table.GetObjectTableRecords(0, objectId, OpenMode.ForRead, false);
+                var records = table.GetObjectTableRecords(0, entity, MapOpenMode.OpenForRead, false);
                 if (records.Count == 0)
                 {
                     continue;
                 }
 
                 var record = records[0];
-                var fieldIndex = table.FieldDefinitions.FindField(WorkspaceFieldName);
+                var fieldIndex = FindFieldIndex(table.FieldDefinitions, WorkspaceFieldName);
                 if (fieldIndex < 0)
                 {
                     continue;
@@ -92,6 +93,20 @@ namespace AreaManager.Services
             }
 
             return results;
+        }
+
+        private static int FindFieldIndex(FieldDefinitions fieldDefinitions, string fieldName)
+        {
+            for (var index = 0; index < fieldDefinitions.Count; index++)
+            {
+                var field = fieldDefinitions[index];
+                if (field.Name.Equals(fieldName, StringComparison.OrdinalIgnoreCase))
+                {
+                    return index;
+                }
+            }
+
+            return -1;
         }
 
         private static double CalculateLayerAreaWithinBoundary(Transaction transaction, Database database, Polyline boundary, string layerName)

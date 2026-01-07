@@ -71,8 +71,8 @@ namespace AreaManager.Services
                 WithinExistingDisposition = "No"
             };
 
-            if (enterText.Contains("/P=", StringComparison.OrdinalIgnoreCase) ||
-                enterText.Contains("\\P=", StringComparison.OrdinalIgnoreCase))
+            if (enterText.IndexOf("/P=", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                enterText.IndexOf("\\P=", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 row.Width = "IRREGULAR";
                 row.Length = "IRREGULAR";
