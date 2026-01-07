@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using Autodesk.AutoCAD.DatabaseServices;
@@ -11,56 +11,87 @@ namespace AreaManager.Services
     {
         public static Table CreateTempAreaTable(Point3d insertionPoint, IEnumerable<TempAreaRow> rows)
         {
+            // Create a table without built‑in headings.  The consumer of this service can
+            // overlay their own title and column headers later.  We set up only the data
+            // rows here so that the user has full control over the final appearance.
             var table = new Table
             {
                 TableStyle = ObjectId.Null,
                 Position = insertionPoint
             };
 
+            // Convert the enumerable to a list for efficient indexing and counting
             var rowList = new List<TempAreaRow>(rows);
-            table.SetSize(rowList.Count + 2, 8);
-            table.SetRowHeight(2.5);
-            table.SetColumnWidth(12.0);
 
-            table.Cells[0, 0].TextString = "TEMPORARY AREA(S) INFORMATION";
-            table.MergeCells(CellRange.Create(table, 0, 0, 0, 7));
+            // There are always eight columns: description, id, width, length, area, within dispositions,
+            // existing cut disturbance, and new cut disturbance.  The row count matches the number
+            // of data entries; no extra rows are created for headings.
+            table.SetSize(rowList.Count, 8);
 
-            var headers = new[]
+            // Configure the row height and individual column widths to mirror the provided sample
+            // (values in drawing units).  This yields a table with wide description and equal
+            // spacing for the other numeric columns.
+            table.SetRowHeight(25.0);
+            double[] columnWidths = { 182.0, 60.0, 50.0, 50.0, 120.0, 120.0, 120.0, 120.0 };
+            for (int col = 0; col < columnWidths.Length; col++)
             {
-                "DESCRIPTION",
-                "ID",
-                "WIDTH",
-                "LENGTH",
-                "AREA (ha)",
-                "WITHIN EXISTING DISPOSITIONS",
-                "EXISTING CUT DISTURBANCE (ha)",
-                "NEW CUT DISTURBANCE (ha)"
-            };
-
-            for (var col = 0; col < headers.Length; col++)
-            {
-                table.Cells[1, col].TextString = headers[col];
+                table.Columns[col].Width = columnWidths[col];
             }
 
-            var rowIndex = 2;
+            int rowIndex = 0;
             foreach (var row in rowList)
             {
+                // Populate the description and identifier
                 table.Cells[rowIndex, 0].TextString = row.Description ?? string.Empty;
                 table.Cells[rowIndex, 1].TextString = row.Identifier ?? string.Empty;
-                table.Cells[rowIndex, 2].TextString = row.Width ?? string.Empty;
-                table.Cells[rowIndex, 3].TextString = row.Length ?? string.Empty;
+
+                // Determine if this row represents an irregular area.  If so, merge the width
+                // and length columns into a single cell and place the text once.  Otherwise
+                // populate both cells separately.
+                bool isIrregular = string.Equals(row.Width, "IRREGULAR", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(row.Length, "IRREGULAR", StringComparison.OrdinalIgnoreCase);
+                if (isIrregular)
+                {
+                    // Merge the cells spanning columns 2 and 3 for this row
+                    table.MergeCells(CellRange.Create(table, rowIndex, 2, rowIndex, 3));
+                    table.Cells[rowIndex, 2].TextString = row.Width ?? string.Empty;
+                }
+                else
+                {
+                    table.Cells[rowIndex, 2].TextString = row.Width ?? string.Empty;
+                    table.Cells[rowIndex, 3].TextString = row.Length ?? string.Empty;
+                }
+
+                // Fill in the remaining columns
                 table.Cells[rowIndex, 4].TextString = row.AreaHa ?? string.Empty;
                 table.Cells[rowIndex, 5].TextString = row.WithinExistingDisposition ?? string.Empty;
                 table.Cells[rowIndex, 6].TextString = row.ExistingCutDisturbance ?? string.Empty;
                 table.Cells[rowIndex, 7].TextString = row.NewCutDisturbance ?? string.Empty;
+
+                // Center the text horizontally and vertically for every cell in the row and set
+                // the text height to 10.0.  Using MiddleCenter ensures a consistent look.
+                for (int col = 0; col < 8; col++)
+                {
+                    var cell = table.Cells[rowIndex, col];
+                    cell.Alignment = CellAlignment.MiddleCenter;
+                    cell.TextHeight = 10.0;
+                }
+
                 rowIndex++;
             }
+
+            // Generate the layout to apply column widths, merges and alignment settings before
+            // returning the table to the caller.
+            table.GenerateLayout();
 
             return table;
         }
 
         public static Table CreateWorkspaceTotalsTable(Point3d insertionPoint, IEnumerable<WorkspaceAreaRow> rows)
         {
+            // Create a table for crown area usage without any header rows.  This method mirrors
+            // the example layout provided by setting explicit sizes for rows and columns and
+            // applying consistent alignment and text height across all cells.
             var table = new Table
             {
                 TableStyle = ObjectId.Null,
@@ -68,29 +99,53 @@ namespace AreaManager.Services
             };
 
             var rowList = new List<WorkspaceAreaRow>(rows);
+            // There are nine columns: ID/description, within ha, within ac, outside ha,
+            // outside ac, total ha, total ac, existing cut disturbance ha, new cut disturbance ha.
             table.SetSize(rowList.Count, 9);
 
-            var rowIndex = 0;
-            foreach (var row in rowList)
+            // Set a uniform row height and assign widths to each column based on the sample
+            table.SetRowHeight(25.0);
+            double[] columnWidths2 = { 132.0, 60.0, 60.0, 60.0, 60.0, 50.0, 50.0, 120.0, 120.0 };
+            for (int col = 0; col < columnWidths2.Length; col++)
             {
-                var withinHa = row.ExistingDispositionHa;
-                var withinAc = ConvertHaToAc(withinHa);
-                var outsideHa = row.TotalHa - withinHa;
-                var outsideAc = ConvertHaToAc(outsideHa);
-                var totalAc = ConvertHaToAc(row.TotalHa);
-
-                table.Cells[rowIndex, 0].TextString = row.WorkspaceId ?? string.Empty;
-                table.Cells[rowIndex, 1].TextString = withinHa.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[rowIndex, 2].TextString = withinAc.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[rowIndex, 3].TextString = outsideHa.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[rowIndex, 4].TextString = outsideAc.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[rowIndex, 5].TextString = row.TotalHa.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[rowIndex, 6].TextString = totalAc.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[rowIndex, 7].TextString = row.ExistingCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[rowIndex, 8].TextString = row.NewCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
-                rowIndex++;
+                table.Columns[col].Width = columnWidths2[col];
             }
 
+            int i = 0;
+            foreach (var row in rowList)
+            {
+                // Compute the derived area usage values.  Conversions to acres (Ac.) are
+                // performed here so they can be inserted directly into the table.
+                double withinHa = row.ExistingDispositionHa;
+                double withinAc = ConvertHaToAc(withinHa);
+                double outsideHa = row.TotalHa - withinHa;
+                double outsideAc = ConvertHaToAc(outsideHa);
+                double totalAc = ConvertHaToAc(row.TotalHa);
+
+                // Populate each column of the row
+                table.Cells[i, 0].TextString = row.WorkspaceId ?? string.Empty;
+                table.Cells[i, 1].TextString = withinHa.ToString("0.000", CultureInfo.InvariantCulture);
+                table.Cells[i, 2].TextString = withinAc.ToString("0.000", CultureInfo.InvariantCulture);
+                table.Cells[i, 3].TextString = outsideHa.ToString("0.000", CultureInfo.InvariantCulture);
+                table.Cells[i, 4].TextString = outsideAc.ToString("0.000", CultureInfo.InvariantCulture);
+                table.Cells[i, 5].TextString = row.TotalHa.ToString("0.000", CultureInfo.InvariantCulture);
+                table.Cells[i, 6].TextString = totalAc.ToString("0.000", CultureInfo.InvariantCulture);
+                table.Cells[i, 7].TextString = row.ExistingCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
+                table.Cells[i, 8].TextString = row.NewCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
+
+                // Apply centre alignment and set the text height for each cell in the row
+                for (int col = 0; col < 9; col++)
+                {
+                    var cell = table.Cells[i, col];
+                    cell.Alignment = CellAlignment.MiddleCenter;
+                    cell.TextHeight = 10.0;
+                }
+
+                i++;
+            }
+
+            // Finalize the table's layout before returning
+            table.GenerateLayout();
             return table;
         }
 

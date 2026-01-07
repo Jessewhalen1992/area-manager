@@ -53,7 +53,9 @@
     <Compile Include="Services\TableService.cs" />
     <Compile Include="Services\TextParsingService.cs" />
     <Compile Include="Services\WorkspaceAreaService.cs" />
-    <Compile Include="UI\MainForm.cs" />
+    <Compile Include="UI\MainForm.cs">
+      <SubType>Form</SubType>
+    </Compile>
     <Compile Include="UI\MainForm.Designer.cs" />
   </ItemGroup>
   <ItemGroup>
