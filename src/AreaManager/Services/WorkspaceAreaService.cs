@@ -6,7 +6,9 @@ using Autodesk.AutoCAD.EditorInput;
 using Autodesk.Gis.Map;
 using Autodesk.Gis.Map.ObjectData;
 using AreaManager.Models;
+using AcadTable = Autodesk.AutoCAD.DatabaseServices.Table;
 using MapOpenMode = Autodesk.Gis.Map.Constants.OpenMode;
+using ObjectDataTable = Autodesk.Gis.Map.ObjectData.Table;
 
 namespace AreaManager.Services
 {
@@ -21,7 +23,7 @@ namespace AreaManager.Services
 
             using (var transaction = database.TransactionManager.StartTransaction())
             {
-                var table = transaction.GetObject(tableId, OpenMode.ForRead) as Table;
+                var table = transaction.GetObject(tableId, OpenMode.ForRead) as AcadTable;
                 if (table == null)
                 {
                     return results;
@@ -52,7 +54,7 @@ namespace AreaManager.Services
                 return;
             }
 
-            var table = tables[WorkspaceTableName];
+            ObjectDataTable table = tables[WorkspaceTableName];
 
             var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
             var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForRead);
@@ -116,7 +118,7 @@ namespace AreaManager.Services
             return -1;
         }
 
-        private static List<WorkspaceTableEntry> ReadWorkspaceEntriesFromTable(Editor editor, Table table)
+        private static List<WorkspaceTableEntry> ReadWorkspaceEntriesFromTable(Editor editor, AcadTable table)
         {
             var entries = new List<WorkspaceTableEntry>();
             var headerRow = FindHeaderRow(table);
@@ -184,7 +186,7 @@ namespace AreaManager.Services
             };
         }
 
-        private static int FindHeaderRow(Table table)
+        private static int FindHeaderRow(AcadTable table)
         {
             var maxScan = Math.Min(table.Rows.Count, 2);
             for (var rowIndex = 0; rowIndex < maxScan; rowIndex++)
@@ -213,7 +215,7 @@ namespace AreaManager.Services
             return upper.Contains("DESCRIPTION") || upper.Contains("WORKSPACE") || upper.Contains("W#") || upper.Contains("ID");
         }
 
-        private static WorkspaceColumnMap MapWorkspaceColumns(Table table, int headerRow)
+        private static WorkspaceColumnMap MapWorkspaceColumns(AcadTable table, int headerRow)
         {
             var map = new WorkspaceColumnMap();
             if (headerRow < 0)
@@ -281,7 +283,7 @@ namespace AreaManager.Services
             return map;
         }
 
-        private static string ReadCellText(Table table, int rowIndex, int columnIndex)
+        private static string ReadCellText(AcadTable table, int rowIndex, int columnIndex)
         {
             if (rowIndex < 0 || rowIndex >= table.Rows.Count || columnIndex < 0 || columnIndex >= table.Columns.Count)
             {
@@ -291,7 +293,7 @@ namespace AreaManager.Services
             return table.Cells[rowIndex, columnIndex].TextString ?? string.Empty;
         }
 
-        private static double? ReadCellNumber(Table table, int rowIndex, int columnIndex)
+        private static double? ReadCellNumber(AcadTable table, int rowIndex, int columnIndex)
         {
             var text = ReadCellText(table, rowIndex, columnIndex);
             if (string.IsNullOrWhiteSpace(text))
