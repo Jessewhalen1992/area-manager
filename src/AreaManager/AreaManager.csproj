@@ -7,8 +7,9 @@
     <OutputType>Library</OutputType>
     <RootNamespace>AreaManager</RootNamespace>
     <AssemblyName>AreaManager</AssemblyName>
-    <TargetFrameworkVersion>v4.5</TargetFrameworkVersion>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
+    <TargetFrameworkProfile />
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|AnyCPU'">
     <DebugSymbols>true</DebugSymbols>
@@ -26,10 +27,18 @@
     <WarningLevel>4</WarningLevel>
   </PropertyGroup>
   <ItemGroup>
-    <Reference Include="AcCoreMgd" />
-    <Reference Include="AcDbMgd" />
-    <Reference Include="AcMgd" />
-    <Reference Include="AdMapManagerMgd" />
+    <Reference Include="accoremgd">
+      <HintPath>..\..\..\..\..\..\Program Files\Autodesk\AutoCAD 2022\accoremgd.dll</HintPath>
+    </Reference>
+    <Reference Include="acdbmgd">
+      <HintPath>..\..\..\..\..\..\Program Files\Autodesk\AutoCAD 2022\acdbmgd.dll</HintPath>
+    </Reference>
+    <Reference Include="acmgd">
+      <HintPath>..\..\..\..\..\..\Program Files\Autodesk\AutoCAD 2022\acmgd.dll</HintPath>
+    </Reference>
+    <Reference Include="ManagedMapApi">
+      <HintPath>..\..\..\..\..\..\Program Files\Autodesk\AutoCAD 2022\Map\ManagedMapApi.dll</HintPath>
+    </Reference>
     <Reference Include="System" />
     <Reference Include="System.Core" />
     <Reference Include="System.Drawing" />
@@ -46,7 +55,9 @@
     <Compile Include="Services\WorkspaceAreaService.cs" />
     <Compile Include="UI\MainForm.cs" />
     <Compile Include="UI\MainForm.Designer.cs" />
-    <Compile Include="UI\MainForm.resx" />
+    <Compile Include="UI\MainForm.resx">
+      <SubType>Designer</SubType>
+    </Compile>
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="UI\MainForm.resx">
