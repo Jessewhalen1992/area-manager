@@ -1,9 +1,8 @@
 using System;
 using System.Collections.Generic;
-using Autodesk.AutoCAD.ApplicationServices;
+using System.Linq;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
-using Autodesk.AutoCAD.Geometry;
 using Autodesk.Gis.Map;
 using Autodesk.Gis.Map.ObjectData;
 using AreaManager.Models;
@@ -16,46 +15,41 @@ namespace AreaManager.Services
         private const string WorkspaceTableName = "WORKSPACENUM";
         private const string WorkspaceFieldName = "WORKSPACENUM";
 
-        public static List<WorkspaceAreaRow> CalculateWorkspaceAreas(Editor editor, Database database)
+        public static List<WorkspaceAreaRow> CalculateWorkspaceAreasFromTable(Editor editor, Database database, ObjectId tableId)
         {
             var results = new List<WorkspaceAreaRow>();
 
             using (var transaction = database.TransactionManager.StartTransaction())
             {
-                var workspacePolylines = GetWorkspacePolylines(transaction, database);
-
-                foreach (var workspace in workspacePolylines)
+                var table = transaction.GetObject(tableId, OpenMode.ForRead) as Table;
+                if (table == null)
                 {
-                    var existingCut = CalculateLayerAreaWithinBoundary(transaction, database, workspace.Polyline, "P-EXISTINGCUT");
-                    var existingDispo = CalculateLayerAreaWithinBoundary(transaction, database, workspace.Polyline, "P-EXISTINGDISPO");
-                    var total = existingCut + existingDispo;
-
-                    results.Add(new WorkspaceAreaRow
-                    {
-                        WorkspaceId = workspace.WorkspaceId,
-                        ExistingCutHa = existingCut,
-                        ExistingDispositionHa = existingDispo,
-                        TotalHa = total,
-                        ExistingCutDisturbanceHa = existingCut,
-                        NewCutDisturbanceHa = 0.0
-                    });
+                    return results;
                 }
+
+                WarnOnDuplicateWorkspaceShapes(editor, transaction, database);
+                var entries = ReadWorkspaceEntriesFromTable(editor, table);
+                results.AddRange(entries.Select(BuildWorkspaceAreaRow));
 
                 transaction.Commit();
             }
 
-            return results;
+            return results
+                .OrderBy(row => ParseIdentifierPrefix(row.WorkspaceId))
+                .ThenBy(row => ParseIdentifierNumber(row.WorkspaceId))
+                .ThenBy(row => row.WorkspaceId, StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
 
-        private static List<(string WorkspaceId, Polyline Polyline)> GetWorkspacePolylines(Transaction transaction, Database database)
+        private static void WarnOnDuplicateWorkspaceShapes(Editor editor, Transaction transaction, Database database)
         {
-            var results = new List<(string, Polyline)>();
+            var seen = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             var mapApp = HostMapApplicationServices.Application;
             var tables = mapApp.ActiveProject.ODTables;
 
             if (!tables.IsTableDefined(WorkspaceTableName))
             {
-                return results;
+                return;
             }
 
             var table = tables[WorkspaceTableName];
@@ -85,14 +79,27 @@ namespace AreaManager.Services
                 }
 
                 var value = record[fieldIndex].StrValue;
-                var polyline = entity as Polyline;
-                if (polyline != null && polyline.Closed && !string.IsNullOrWhiteSpace(value))
+                if (string.IsNullOrWhiteSpace(value))
                 {
-                    results.Add((value, polyline));
+                    continue;
+                }
+
+                var key = value.Trim();
+                if (seen.ContainsKey(key))
+                {
+                    seen[key] += 1;
+                }
+                else
+                {
+                    seen[key] = 1;
                 }
             }
 
-            return results;
+            var duplicates = seen.Where(item => item.Value > 1).Select(item => item.Key).ToList();
+            if (duplicates.Count > 0)
+            {
+                editor.WriteMessage($"\nWarning: Duplicate WORKSPACENUM values found in object data: {string.Join(", ", duplicates)}.");
+            }
         }
 
         private static int FindFieldIndex(FieldDefinitions fieldDefinitions, string fieldName)
@@ -109,61 +116,336 @@ namespace AreaManager.Services
             return -1;
         }
 
-        private static double CalculateLayerAreaWithinBoundary(Transaction transaction, Database database, Polyline boundary, string layerName)
+        private static List<WorkspaceTableEntry> ReadWorkspaceEntriesFromTable(Editor editor, Table table)
         {
-            var area = 0.0;
-            var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
-            var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+            var entries = new List<WorkspaceTableEntry>();
+            var headerRow = FindHeaderRow(table);
+            var columnMap = MapWorkspaceColumns(table, headerRow);
+            var startRow = headerRow >= 0 ? headerRow + 1 : 0;
 
-            foreach (ObjectId objectId in modelSpace)
+            var duplicates = new Dictionary<string, WorkspaceTableEntry>(StringComparer.OrdinalIgnoreCase);
+
+            for (var rowIndex = startRow; rowIndex < table.Rows.Count; rowIndex++)
             {
-                var entity = transaction.GetObject(objectId, OpenMode.ForRead) as Entity;
-                if (entity == null || !entity.Layer.Equals(layerName, StringComparison.OrdinalIgnoreCase))
+                var workspaceId = ReadCellText(table, rowIndex, columnMap.WorkspaceIdColumn);
+                if (string.IsNullOrWhiteSpace(workspaceId))
                 {
                     continue;
                 }
 
-                var curve = entity as Curve;
-                if (curve == null || !curve.Closed)
+                var entry = new WorkspaceTableEntry
+                {
+                    WorkspaceId = workspaceId.Trim(),
+                    Width = ReadCellNumber(table, rowIndex, columnMap.WidthColumn),
+                    Length = ReadCellNumber(table, rowIndex, columnMap.LengthColumn),
+                    AreaHa = ReadCellNumber(table, rowIndex, columnMap.AreaColumn),
+                    ExistingDispositionHa = ReadCellNumber(table, rowIndex, columnMap.ExistingDispositionColumn),
+                    ExistingCutHa = ReadCellNumber(table, rowIndex, columnMap.ExistingCutColumn),
+                    TotalHa = ReadCellNumber(table, rowIndex, columnMap.TotalColumn)
+                };
+
+                entry.TotalHa = ResolveTotalArea(entry);
+
+                if (!duplicates.TryGetValue(entry.WorkspaceId, out var existing))
+                {
+                    duplicates[entry.WorkspaceId] = entry;
+                    continue;
+                }
+
+                if (EntriesMatch(existing, entry))
                 {
                     continue;
                 }
 
-                area += CalculateIntersectionArea(boundary, curve);
+                var resolved = ResolveDuplicateEntry(existing, entry);
+                duplicates[entry.WorkspaceId] = resolved;
+
+                editor.WriteMessage($"\nWarning: Duplicate workspace '{entry.WorkspaceId}' with different sizes/areas detected. Using the larger area.");
             }
 
-            return area / 10000.0;
+            entries.AddRange(duplicates.Values);
+            return entries;
         }
 
-        private static double CalculateIntersectionArea(Polyline boundary, Curve target)
+        private static WorkspaceAreaRow BuildWorkspaceAreaRow(WorkspaceTableEntry entry)
         {
-            var regionBoundary = CreateRegion(boundary);
-            var regionTarget = CreateRegion(target);
+            var existingCut = entry.ExistingCutHa ?? 0.0;
+            var existingDisposition = entry.ExistingDispositionHa ?? 0.0;
+            var total = entry.TotalHa ?? (existingCut + existingDisposition);
 
-            if (regionBoundary == null || regionTarget == null)
+            return new WorkspaceAreaRow
             {
-                return 0.0;
-            }
-
-            using (regionBoundary)
-            using (regionTarget)
-            {
-                regionBoundary.BooleanOperation(BooleanOperationType.BoolIntersect, regionTarget);
-                return regionBoundary.Area;
-            }
+                WorkspaceId = entry.WorkspaceId,
+                ExistingCutHa = existingCut,
+                ExistingDispositionHa = existingDisposition,
+                TotalHa = total,
+                ExistingCutDisturbanceHa = existingCut,
+                NewCutDisturbanceHa = 0.0
+            };
         }
 
-        private static Region CreateRegion(Curve curve)
+        private static int FindHeaderRow(Table table)
         {
-            if (curve == null || !curve.Closed)
+            var maxScan = Math.Min(table.Rows.Count, 2);
+            for (var rowIndex = 0; rowIndex < maxScan; rowIndex++)
+            {
+                for (var colIndex = 0; colIndex < table.Columns.Count; colIndex++)
+                {
+                    var text = ReadCellText(table, rowIndex, colIndex);
+                    if (IsHeaderText(text))
+                    {
+                        return rowIndex;
+                    }
+                }
+            }
+
+            return -1;
+        }
+
+        private static bool IsHeaderText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            var upper = text.Trim().ToUpperInvariant();
+            return upper.Contains("DESCRIPTION") || upper.Contains("WORKSPACE") || upper.Contains("W#") || upper.Contains("ID");
+        }
+
+        private static WorkspaceColumnMap MapWorkspaceColumns(Table table, int headerRow)
+        {
+            var map = new WorkspaceColumnMap();
+            if (headerRow < 0)
+            {
+                map.WorkspaceIdColumn = 0;
+                return map;
+            }
+
+            for (var colIndex = 0; colIndex < table.Columns.Count; colIndex++)
+            {
+                var header = ReadCellText(table, headerRow, colIndex);
+                if (string.IsNullOrWhiteSpace(header))
+                {
+                    continue;
+                }
+
+                var normalized = header.Trim().ToUpperInvariant();
+                if (map.WorkspaceIdColumn < 0 && (normalized.Contains("WORKSPACE") || normalized.Contains("W#") || normalized == "ID" || normalized.Contains("DESCRIPTION")))
+                {
+                    map.WorkspaceIdColumn = colIndex;
+                    continue;
+                }
+
+                if (map.WidthColumn < 0 && normalized.Contains("WIDTH"))
+                {
+                    map.WidthColumn = colIndex;
+                    continue;
+                }
+
+                if (map.LengthColumn < 0 && normalized.Contains("LENGTH"))
+                {
+                    map.LengthColumn = colIndex;
+                    continue;
+                }
+
+                if (map.ExistingDispositionColumn < 0 && normalized.Contains("DISPOSITION"))
+                {
+                    map.ExistingDispositionColumn = colIndex;
+                    continue;
+                }
+
+                if (map.ExistingCutColumn < 0 && normalized.Contains("EXISTING CUT"))
+                {
+                    map.ExistingCutColumn = colIndex;
+                    continue;
+                }
+
+                if (map.TotalColumn < 0 && normalized.Contains("TOTAL"))
+                {
+                    map.TotalColumn = colIndex;
+                    continue;
+                }
+
+                if (map.AreaColumn < 0 && normalized.Contains("AREA"))
+                {
+                    map.AreaColumn = colIndex;
+                }
+            }
+
+            if (map.WorkspaceIdColumn < 0)
+            {
+                map.WorkspaceIdColumn = 0;
+            }
+
+            return map;
+        }
+
+        private static string ReadCellText(Table table, int rowIndex, int columnIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= table.Rows.Count || columnIndex < 0 || columnIndex >= table.Columns.Count)
+            {
+                return string.Empty;
+            }
+
+            return table.Cells[rowIndex, columnIndex].TextString ?? string.Empty;
+        }
+
+        private static double? ReadCellNumber(Table table, int rowIndex, int columnIndex)
+        {
+            var text = ReadCellText(table, rowIndex, columnIndex);
+            if (string.IsNullOrWhiteSpace(text))
             {
                 return null;
             }
 
-            var curves = new DBObjectCollection { curve };
-            var regions = Region.CreateFromCurves(curves);
+            var numberText = TextParsingService.ExtractLastNumber(text);
+            if (string.IsNullOrWhiteSpace(numberText))
+            {
+                return null;
+            }
 
-            return regions.Count > 0 ? regions[0] as Region : null;
+            return TextParsingService.ParseDoubleOrDefault(numberText);
+        }
+
+        private static double? ResolveTotalArea(WorkspaceTableEntry entry)
+        {
+            if (entry.TotalHa.HasValue)
+            {
+                return entry.TotalHa.Value;
+            }
+
+            if (entry.AreaHa.HasValue)
+            {
+                return entry.AreaHa.Value;
+            }
+
+            if (entry.Width.HasValue && entry.Length.HasValue)
+            {
+                return (entry.Width.Value * entry.Length.Value) / 10000.0;
+            }
+
+            if (entry.ExistingCutHa.HasValue || entry.ExistingDispositionHa.HasValue)
+            {
+                return (entry.ExistingCutHa ?? 0.0) + (entry.ExistingDispositionHa ?? 0.0);
+            }
+
+            return null;
+        }
+
+        private static bool EntriesMatch(WorkspaceTableEntry first, WorkspaceTableEntry second)
+        {
+            return ValuesMatch(first.Width, second.Width)
+                && ValuesMatch(first.Length, second.Length)
+                && ValuesMatch(first.AreaHa, second.AreaHa)
+                && ValuesMatch(first.TotalHa, second.TotalHa)
+                && ValuesMatch(first.ExistingDispositionHa, second.ExistingDispositionHa)
+                && ValuesMatch(first.ExistingCutHa, second.ExistingCutHa);
+        }
+
+        private static bool ValuesMatch(double? first, double? second)
+        {
+            if (!first.HasValue && !second.HasValue)
+            {
+                return true;
+            }
+
+            if (!first.HasValue || !second.HasValue)
+            {
+                return false;
+            }
+
+            return Math.Abs(first.Value - second.Value) < 0.0001;
+        }
+
+        private static WorkspaceTableEntry ResolveDuplicateEntry(WorkspaceTableEntry existing, WorkspaceTableEntry candidate)
+        {
+            var existingArea = existing.TotalHa ?? existing.AreaHa ?? 0.0;
+            var candidateArea = candidate.TotalHa ?? candidate.AreaHa ?? 0.0;
+
+            if (!existing.TotalHa.HasValue && existing.Width.HasValue && existing.Length.HasValue)
+            {
+                existingArea = (existing.Width.Value * existing.Length.Value) / 10000.0;
+            }
+
+            if (!candidate.TotalHa.HasValue && candidate.Width.HasValue && candidate.Length.HasValue)
+            {
+                candidateArea = (candidate.Width.Value * candidate.Length.Value) / 10000.0;
+            }
+
+            return candidateArea > existingArea ? candidate : existing;
+        }
+
+        private static string ParseIdentifierPrefix(string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier))
+            {
+                return string.Empty;
+            }
+
+            var trimmed = identifier.Trim();
+            var index = 0;
+            while (index < trimmed.Length && char.IsLetter(trimmed[index]))
+            {
+                index++;
+            }
+
+            return trimmed.Substring(0, index).ToUpperInvariant();
+        }
+
+        private static int ParseIdentifierNumber(string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier))
+            {
+                return int.MaxValue;
+            }
+
+            var trimmed = identifier.Trim();
+            var index = 0;
+            while (index < trimmed.Length && char.IsLetter(trimmed[index]))
+            {
+                index++;
+            }
+
+            var numberStart = index;
+            while (index < trimmed.Length && char.IsDigit(trimmed[index]))
+            {
+                index++;
+            }
+
+            if (numberStart == index)
+            {
+                return int.MaxValue;
+            }
+
+            if (int.TryParse(trimmed.Substring(numberStart, index - numberStart), out var number))
+            {
+                return number;
+            }
+
+            return int.MaxValue;
+        }
+
+        private class WorkspaceColumnMap
+        {
+            public int WorkspaceIdColumn { get; set; } = -1;
+            public int WidthColumn { get; set; } = -1;
+            public int LengthColumn { get; set; } = -1;
+            public int AreaColumn { get; set; } = -1;
+            public int ExistingDispositionColumn { get; set; } = -1;
+            public int ExistingCutColumn { get; set; } = -1;
+            public int TotalColumn { get; set; } = -1;
+        }
+
+        private class WorkspaceTableEntry
+        {
+            public string WorkspaceId { get; set; }
+            public double? Width { get; set; }
+            public double? Length { get; set; }
+            public double? AreaHa { get; set; }
+            public double? ExistingDispositionHa { get; set; }
+            public double? ExistingCutHa { get; set; }
+            public double? TotalHa { get; set; }
         }
     }
 }

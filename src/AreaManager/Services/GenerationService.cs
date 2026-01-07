@@ -33,10 +33,16 @@ namespace AreaManager.Services
             var editor = document.Editor;
             var database = document.Database;
 
-            var workspaceRows = WorkspaceAreaService.CalculateWorkspaceAreas(editor, database);
+            var tableSelection = PromptForWorkspaceTable(editor);
+            if (tableSelection == ObjectId.Null)
+            {
+                return;
+            }
+
+            var workspaceRows = WorkspaceAreaService.CalculateWorkspaceAreasFromTable(editor, database, tableSelection);
             if (workspaceRows.Count == 0)
             {
-                editor.WriteMessage("\nNo workspace shapes with WORKSPACENUM found.");
+                editor.WriteMessage("\nNo workspace rows found in the selected table.");
                 return;
             }
 
@@ -58,7 +64,9 @@ namespace AreaManager.Services
             }
 
             return rows
-                .OrderBy(row => row.Identifier, StringComparer.OrdinalIgnoreCase)
+                .OrderBy(row => ParseIdentifierPrefix(row.Identifier))
+                .ThenBy(row => ParseIdentifierNumber(row.Identifier))
+                .ThenBy(row => row.Identifier, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
 
@@ -205,6 +213,7 @@ namespace AreaManager.Services
             using (var transaction = database.TransactionManager.StartTransaction())
             {
                 var table = TableService.CreateWorkspaceTotalsTable(promptPoint.Value, rows);
+                ApplyTableStyle(transaction, database, editor, table, "Induction Bend");
                 var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
                 var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
 
@@ -212,6 +221,81 @@ namespace AreaManager.Services
                 transaction.AddNewlyCreatedDBObject(table, true);
                 transaction.Commit();
             }
+        }
+
+        private static ObjectId PromptForWorkspaceTable(Editor editor)
+        {
+            var options = new PromptEntityOptions("\nSelect workspace source table: ")
+            {
+                AllowNone = false
+            };
+            options.SetRejectMessage("\nOnly tables are allowed.");
+            options.AddAllowedClass(typeof(Table), true);
+
+            var result = editor.GetEntity(options);
+            return result.Status == PromptStatus.OK ? result.ObjectId : ObjectId.Null;
+        }
+
+        private static void ApplyTableStyle(Transaction transaction, Database database, Editor editor, Table table, string styleName)
+        {
+            var dictionary = (DBDictionary)transaction.GetObject(database.TableStyleDictionaryId, OpenMode.ForRead);
+            if (!dictionary.Contains(styleName))
+            {
+                editor.WriteMessage($"\nWarning: Table style '{styleName}' was not found.");
+                return;
+            }
+
+            table.TableStyle = dictionary.GetAt(styleName);
+        }
+
+        private static string ParseIdentifierPrefix(string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier))
+            {
+                return string.Empty;
+            }
+
+            var trimmed = identifier.Trim();
+            var index = 0;
+            while (index < trimmed.Length && char.IsLetter(trimmed[index]))
+            {
+                index++;
+            }
+
+            return trimmed.Substring(0, index).ToUpperInvariant();
+        }
+
+        private static int ParseIdentifierNumber(string identifier)
+        {
+            if (string.IsNullOrWhiteSpace(identifier))
+            {
+                return int.MaxValue;
+            }
+
+            var trimmed = identifier.Trim();
+            var index = 0;
+            while (index < trimmed.Length && char.IsLetter(trimmed[index]))
+            {
+                index++;
+            }
+
+            var numberStart = index;
+            while (index < trimmed.Length && char.IsDigit(trimmed[index]))
+            {
+                index++;
+            }
+
+            if (numberStart == index)
+            {
+                return int.MaxValue;
+            }
+
+            if (int.TryParse(trimmed.Substring(numberStart, index - numberStart), out var number))
+            {
+                return number;
+            }
+
+            return int.MaxValue;
         }
     }
 }
