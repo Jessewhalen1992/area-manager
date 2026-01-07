@@ -12,6 +12,12 @@ using ObjectDataTable = Autodesk.Gis.Map.ObjectData.Table;
 
 namespace AreaManager.Services
 {
+    /// <summary>
+    /// Service responsible for reading workspace rows from a source table and computing
+    /// aggregate area values for the crown area usage report.  This implementation has
+    /// been updated to better handle tables without explicit header rows and to
+    /// interpret "Yes"/"No" values in the "within existing dispositions" column.
+    /// </summary>
     public static class WorkspaceAreaService
     {
         private const string WorkspaceTableName = "WORKSPACENUM";
@@ -54,7 +60,7 @@ namespace AreaManager.Services
                 return;
             }
 
-            ObjectDataTable table = tables[WorkspaceTableName];
+            ObjectDataTable odTable = tables[WorkspaceTableName];
 
             var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
             var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForRead);
@@ -67,14 +73,14 @@ namespace AreaManager.Services
                     continue;
                 }
 
-                var records = table.GetObjectTableRecords(0, entity, MapOpenMode.OpenForRead, false);
+                var records = odTable.GetObjectTableRecords(0, entity, MapOpenMode.OpenForRead, false);
                 if (records.Count == 0)
                 {
                     continue;
                 }
 
                 var record = records[0];
-                var fieldIndex = FindFieldIndex(table.FieldDefinitions, WorkspaceFieldName);
+                var fieldIndex = FindFieldIndex(odTable.FieldDefinitions, WorkspaceFieldName);
                 if (fieldIndex < 0)
                 {
                     continue;
@@ -118,6 +124,14 @@ namespace AreaManager.Services
             return -1;
         }
 
+        /// <summary>
+        /// Reads each row from the selected workspace source table and produces a list of
+        /// WorkspaceTableEntry objects.  The logic here interprets the "within existing dispositions"
+        /// column: when the cell contains "Yes" (case insensitive) and no numeric disposition value
+        /// is present, the row's entire area is considered part of the existing disposition; when the
+        /// cell contains "No" and no numeric cut value is present, the area is treated as existing
+        /// cut.  Numeric values in either column override this behaviour.
+        /// </summary>
         private static List<WorkspaceTableEntry> ReadWorkspaceEntriesFromTable(Editor editor, AcadTable table)
         {
             var entries = new List<WorkspaceTableEntry>();
@@ -146,7 +160,39 @@ namespace AreaManager.Services
                     TotalHa = ReadCellNumber(table, rowIndex, columnMap.TotalColumn)
                 };
 
+                // Calculate the total area using width/length or area fields as appropriate
                 entry.TotalHa = ResolveTotalArea(entry);
+
+                // Interpret the 'within existing dispositions' column.  If the cell contains
+                // 'Yes' or 'No' (case insensitive) and the existing disposition field isn't numeric,
+                // use the entire area as the disposition or cut accordingly.
+                if (columnMap.ExistingDispositionColumn >= 0)
+                {
+                    if (!entry.ExistingDispositionHa.HasValue)
+                    {
+                        var dispText = ReadCellText(table, rowIndex, columnMap.ExistingDispositionColumn);
+                        if (!string.IsNullOrWhiteSpace(dispText))
+                        {
+                            var normalized = dispText.Trim().ToUpperInvariant();
+                            if (normalized == "YES")
+                            {
+                                if (entry.TotalHa.HasValue)
+                                {
+                                    entry.ExistingDispositionHa = entry.TotalHa;
+                                    entry.ExistingCutHa = 0.0;
+                                }
+                            }
+                            else if (normalized == "NO")
+                            {
+                                if (!entry.ExistingCutHa.HasValue && entry.TotalHa.HasValue)
+                                {
+                                    entry.ExistingCutHa = entry.TotalHa;
+                                    entry.ExistingDispositionHa = 0.0;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if (!duplicates.TryGetValue(entry.WorkspaceId, out var existing))
                 {
@@ -169,58 +215,27 @@ namespace AreaManager.Services
             return entries;
         }
 
-        private static WorkspaceAreaRow BuildWorkspaceAreaRow(WorkspaceTableEntry entry)
-        {
-            var existingCut = entry.ExistingCutHa ?? 0.0;
-            var existingDisposition = entry.ExistingDispositionHa ?? 0.0;
-            var total = entry.TotalHa ?? (existingCut + existingDisposition);
-
-            return new WorkspaceAreaRow
-            {
-                WorkspaceId = entry.WorkspaceId,
-                ExistingCutHa = existingCut,
-                ExistingDispositionHa = existingDisposition,
-                TotalHa = total,
-                ExistingCutDisturbanceHa = existingCut,
-                NewCutDisturbanceHa = 0.0
-            };
-        }
-
-        private static int FindHeaderRow(AcadTable table)
-        {
-            var maxScan = Math.Min(table.Rows.Count, 2);
-            for (var rowIndex = 0; rowIndex < maxScan; rowIndex++)
-            {
-                for (var colIndex = 0; colIndex < table.Columns.Count; colIndex++)
-                {
-                    var text = ReadCellText(table, rowIndex, colIndex);
-                    if (IsHeaderText(text))
-                    {
-                        return rowIndex;
-                    }
-                }
-            }
-
-            return -1;
-        }
-
-        private static bool IsHeaderText(string text)
-        {
-            if (string.IsNullOrWhiteSpace(text))
-            {
-                return false;
-            }
-
-            var upper = text.Trim().ToUpperInvariant();
-            return upper.Contains("DESCRIPTION") || upper.Contains("WORKSPACE") || upper.Contains("W#") || upper.Contains("ID");
-        }
-
+        /// <summary>
+        /// Maps column indices to their respective roles.  When a header row isn't found,
+        /// this method assumes a fixed column layout corresponding to the default
+        /// temporary areas table: description, workspace ID, width, length, area,
+        /// within dispositions, existing cut disturbance, new cut disturbance.
+        /// </summary>
         private static WorkspaceColumnMap MapWorkspaceColumns(AcadTable table, int headerRow)
         {
             var map = new WorkspaceColumnMap();
             if (headerRow < 0)
             {
-                map.WorkspaceIdColumn = 0;
+                // Default mapping for a table without a header.  Column 1 holds the workspace ID (identifier),
+                // columns 2 and 3 hold width and length, column 4 is area, column 5 is the within dispositions
+                // flag (Yes/No), column 6 is the existing cut area, and column 7 (if present) is new cut (ignored).
+                map.WorkspaceIdColumn = 1;
+                map.WidthColumn = 2;
+                map.LengthColumn = 3;
+                map.AreaColumn = 4;
+                map.ExistingDispositionColumn = 5;
+                map.ExistingCutColumn = 6;
+                map.TotalColumn = -1;
                 return map;
             }
 
@@ -277,7 +292,8 @@ namespace AreaManager.Services
 
             if (map.WorkspaceIdColumn < 0)
             {
-                map.WorkspaceIdColumn = 0;
+                // default to identifier column if not mapped
+                map.WorkspaceIdColumn = 1;
             }
 
             return map;
@@ -333,6 +349,63 @@ namespace AreaManager.Services
             }
 
             return null;
+        }
+
+        /// <summary>
+        /// Constructs a WorkspaceAreaRow from a raw table entry by populating totals and disturbances.
+        /// Existing disposition and cut values are passed through directly, and the total is computed
+        /// if not explicitly provided.  New cut disturbance is always zero in this context.
+        /// </summary>
+        private static WorkspaceAreaRow BuildWorkspaceAreaRow(WorkspaceTableEntry entry)
+        {
+            var existingCut = entry.ExistingCutHa ?? 0.0;
+            var existingDisposition = entry.ExistingDispositionHa ?? 0.0;
+            var total = entry.TotalHa ?? (existingCut + existingDisposition);
+
+            return new WorkspaceAreaRow
+            {
+                WorkspaceId = entry.WorkspaceId,
+                ExistingCutHa = existingCut,
+                ExistingDispositionHa = existingDisposition,
+                TotalHa = total,
+                ExistingCutDisturbanceHa = existingCut,
+                NewCutDisturbanceHa = 0.0
+            };
+        }
+
+        /// <summary>
+        /// Attempts to locate a header row by scanning the first two rows of the table for cells
+        /// containing typical header text (e.g., "WORKSPACE" or "DESCRIPTION").  Returns the index
+        /// of the header row or -1 if none is found.
+        /// </summary>
+        private static int FindHeaderRow(AcadTable table)
+        {
+            var maxScan = Math.Min(table.Rows.Count, 2);
+            for (var rowIndex = 0; rowIndex < maxScan; rowIndex++)
+            {
+                for (var colIndex = 0; colIndex < table.Columns.Count; colIndex++)
+                {
+                    var text = ReadCellText(table, rowIndex, colIndex);
+                    if (IsHeaderText(text))
+                    {
+                        return rowIndex;
+                    }
+                }
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// Determines whether a given cell value likely belongs to a header row based on keywords.
+        /// </summary>
+        private static bool IsHeaderText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+            var upper = text.Trim().ToUpperInvariant();
+            return upper.Contains("DESCRIPTION") || upper.Contains("WORKSPACE") || upper.Contains("W#") || upper.Contains("ID");
         }
 
         private static bool EntriesMatch(WorkspaceTableEntry first, WorkspaceTableEntry second)

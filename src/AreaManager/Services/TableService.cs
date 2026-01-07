@@ -111,27 +111,61 @@ namespace AreaManager.Services
                 table.Columns[col].Width = columnWidths2[col];
             }
 
+            // Define colours for shading: use a very light colour (e.g. index 254) for
+            // the grand total row and no shading for per‑activity totals.  Colour 254
+            // corresponds to a light grey in most AutoCAD colour tables.  By using
+            // FromColorIndex, we avoid specifying RGB values that might look different
+            // under various colour schemes.
+            var summaryColor = Autodesk.AutoCAD.Colors.Color.FromColorIndex(Autodesk.AutoCAD.Colors.ColorMethod.ByAci, 254);
+
             int i = 0;
             foreach (var row in rowList)
             {
-                // Compute the derived area usage values.  Conversions to acres (Ac.) are
-                // performed here so they can be inserted directly into the table.
-                double withinHa = row.ExistingDispositionHa;
-                double withinAc = ConvertHaToAc(withinHa);
-                double outsideHa = row.TotalHa - withinHa;
-                double outsideAc = ConvertHaToAc(outsideHa);
-                double totalAc = ConvertHaToAc(row.TotalHa);
+                bool isTotalsRow = string.IsNullOrEmpty(row.WorkspaceId);
 
-                // Populate each column of the row
-                table.Cells[i, 0].TextString = row.WorkspaceId ?? string.Empty;
-                table.Cells[i, 1].TextString = withinHa.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[i, 2].TextString = withinAc.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[i, 3].TextString = outsideHa.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[i, 4].TextString = outsideAc.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[i, 5].TextString = row.TotalHa.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[i, 6].TextString = totalAc.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[i, 7].TextString = row.ExistingCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
-                table.Cells[i, 8].TextString = row.NewCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
+                if (isTotalsRow)
+                {
+                    // For the grand total row, leave the description and intermediate
+                    // columns blank.  Populate only the total ha and total ac cells with
+                    // the aggregated values.  Colour these cells using the summary colour.
+                    table.Cells[i, 0].TextString = string.Empty;
+                    for (int col = 1; col <= 4; col++)
+                    {
+                        table.Cells[i, col].TextString = string.Empty;
+                    }
+                    table.Cells[i, 5].TextString = row.TotalHa.ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 6].TextString = ConvertHaToAc(row.TotalHa).ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 5].BackgroundColor = summaryColor;
+                    table.Cells[i, 6].BackgroundColor = summaryColor;
+                    table.Cells[i, 7].TextString = string.Empty;
+                    table.Cells[i, 8].TextString = string.Empty;
+                }
+                else
+                {
+                    // Compute the derived area usage values.  Conversions to acres (Ac.) are
+                    // performed here so they can be inserted directly into the table.  These
+                    // represent existing disposition, outside existing dispositions and totals.
+                    double withinHa = row.ExistingDispositionHa;
+                    double withinAc = ConvertHaToAc(withinHa);
+                    double outsideHa = row.TotalHa - withinHa;
+                    double outsideAc = ConvertHaToAc(outsideHa);
+                    double totalAc = ConvertHaToAc(row.TotalHa);
+
+                    // Populate each column of the row
+                    table.Cells[i, 0].TextString = row.WorkspaceId ?? string.Empty;
+                    table.Cells[i, 1].TextString = withinHa.ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 2].TextString = withinAc.ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 3].TextString = outsideHa.ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 4].TextString = outsideAc.ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 5].TextString = row.TotalHa.ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 6].TextString = totalAc.ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 7].TextString = row.ExistingCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
+                    table.Cells[i, 8].TextString = row.NewCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
+                    // Do not set a background colour for per‑activity totals; these cells
+                    // remain white (default) so the user can identify them as calculated
+                    // values without shading.  Note that formulas are not inserted via
+                    // API: the numeric values are calculated directly.
+                }
 
                 // Apply centre alignment and set the text height for each cell in the row
                 for (int col = 0; col < 9; col++)
