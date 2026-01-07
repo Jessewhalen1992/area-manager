@@ -68,32 +68,9 @@ namespace AreaManager.Services
             };
 
             var rowList = new List<WorkspaceAreaRow>(rows);
-            table.SetSize(rowList.Count + 2, 9);
-            table.SetRowHeight(2.5);
-            table.SetColumnWidth(12.0);
+            table.SetSize(rowList.Count, 9);
 
-            table.Cells[0, 0].TextString = "CROWN AREA USAGE (TEMPORARY)";
-            table.MergeCells(CellRange.Create(table, 0, 0, 0, 8));
-
-            var headers = new[]
-            {
-                "DESCRIPTION",
-                "WITHIN EXISTING DISPOSITIONS (ha)",
-                "WITHIN EXISTING DISPOSITIONS (Ac.)",
-                "OUTSIDE EXISTING DISPOSITIONS (ha)",
-                "OUTSIDE EXISTING DISPOSITIONS (Ac.)",
-                "TOTAL (ha)",
-                "TOTAL (Ac.)",
-                "EXISTING CUT DISTURBANCE (ha)",
-                "NEW CUT DISTURBANCE (ha)"
-            };
-
-            for (var col = 0; col < headers.Length; col++)
-            {
-                table.Cells[1, col].TextString = headers[col];
-            }
-
-            var rowIndex = 2;
+            var rowIndex = 0;
             foreach (var row in rowList)
             {
                 var withinHa = row.ExistingDispositionHa;
