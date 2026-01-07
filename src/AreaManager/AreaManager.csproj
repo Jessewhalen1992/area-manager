@@ -55,9 +55,6 @@
     <Compile Include="Services\WorkspaceAreaService.cs" />
     <Compile Include="UI\MainForm.cs" />
     <Compile Include="UI\MainForm.Designer.cs" />
-    <Compile Include="UI\MainForm.resx">
-      <SubType>Designer</SubType>
-    </Compile>
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="UI\MainForm.resx">
