@@ -32,7 +32,11 @@ namespace AreaManager.Services
             // (values in drawing units).  This yields a table with wide description and equal
             // spacing for the other numeric columns.
             table.SetRowHeight(25.0);
-            double[] columnWidths = { 182.0, 60.0, 50.0, 50.0, 120.0, 120.0, 120.0, 120.0 };
+            // Column widths are based on the provided sample.  The description column
+            // should be narrower (162 units) and the identifier column ("#") much narrower
+            // (40 units) than our previous implementation.  The area column is only 50
+            // units wide, while the last three disturbance columns remain wide (120 units).
+            double[] columnWidths = { 162.0, 40.0, 50.0, 50.0, 50.0, 120.0, 120.0, 120.0 };
             for (int col = 0; col < columnWidths.Length; col++)
             {
                 table.Columns[col].Width = columnWidths[col];

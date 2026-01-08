@@ -157,7 +157,8 @@ namespace AreaManager.Services
                     AreaHa = ReadCellNumber(table, rowIndex, columnMap.AreaColumn),
                     ExistingDispositionHa = ReadCellNumber(table, rowIndex, columnMap.ExistingDispositionColumn),
                     ExistingCutHa = ReadCellNumber(table, rowIndex, columnMap.ExistingCutColumn),
-                    TotalHa = ReadCellNumber(table, rowIndex, columnMap.TotalColumn)
+                    TotalHa = ReadCellNumber(table, rowIndex, columnMap.TotalColumn),
+                    NewCutHa = ReadCellNumber(table, rowIndex, columnMap.NewCutColumn)
                 };
 
                 // Calculate the total area using width/length or area fields as appropriate
@@ -235,6 +236,7 @@ namespace AreaManager.Services
                 map.AreaColumn = 4;
                 map.ExistingDispositionColumn = 5;
                 map.ExistingCutColumn = 6;
+                map.NewCutColumn = 7;
                 map.TotalColumn = -1;
                 return map;
             }
@@ -275,6 +277,12 @@ namespace AreaManager.Services
                 if (map.ExistingCutColumn < 0 && normalized.Contains("EXISTING CUT"))
                 {
                     map.ExistingCutColumn = colIndex;
+                    continue;
+                }
+
+                if (map.NewCutColumn < 0 && normalized.Contains("NEW CUT"))
+                {
+                    map.NewCutColumn = colIndex;
                     continue;
                 }
 
@@ -343,9 +351,12 @@ namespace AreaManager.Services
                 return (entry.Width.Value * entry.Length.Value) / 10000.0;
             }
 
-            if (entry.ExistingCutHa.HasValue || entry.ExistingDispositionHa.HasValue)
+            // Derive the total from existing components if present.  When any of the
+            // disturbance values are provided, sum them all to obtain the total.  This
+            // accommodates tables that explicitly include a new cut column.
+            if (entry.ExistingCutHa.HasValue || entry.ExistingDispositionHa.HasValue || entry.NewCutHa.HasValue)
             {
-                return (entry.ExistingCutHa ?? 0.0) + (entry.ExistingDispositionHa ?? 0.0);
+                return (entry.ExistingCutHa ?? 0.0) + (entry.ExistingDispositionHa ?? 0.0) + (entry.NewCutHa ?? 0.0);
             }
 
             return null;
@@ -360,7 +371,17 @@ namespace AreaManager.Services
         {
             var existingCut = entry.ExistingCutHa ?? 0.0;
             var existingDisposition = entry.ExistingDispositionHa ?? 0.0;
-            var total = entry.TotalHa ?? (existingCut + existingDisposition);
+            // Determine the total area for this workspace.  Prefer the explicit
+            // TotalHa value if provided; otherwise compute it as the sum of existing
+            // cut, existing disposition and new cut (when supplied) or fall back to
+            // the sum of the known components.
+            var total = entry.TotalHa ?? (existingCut + existingDisposition + (entry.NewCutHa ?? 0.0));
+            // Compute the new cut disturbance.  If a new cut value was read from the
+            // table, use it directly.  Otherwise derive it from the total minus
+            // existing cut and disposition.  Clamp negative values to zero to guard
+            // against inconsistent data.
+            var newCut = entry.NewCutHa ?? (total - existingCut - existingDisposition);
+            if (newCut < 0) newCut = 0.0;
 
             return new WorkspaceAreaRow
             {
@@ -368,8 +389,10 @@ namespace AreaManager.Services
                 ExistingCutHa = existingCut,
                 ExistingDispositionHa = existingDisposition,
                 TotalHa = total,
-                ExistingCutDisturbanceHa = existingCut,
-                NewCutDisturbanceHa = 0.0
+                // Existing cut disturbance includes both existing cut and existing
+                // disposition areas.
+                ExistingCutDisturbanceHa = existingCut + existingDisposition,
+                NewCutDisturbanceHa = newCut
             };
         }
 
@@ -510,6 +533,12 @@ namespace AreaManager.Services
             public int ExistingDispositionColumn { get; set; } = -1;
             public int ExistingCutColumn { get; set; } = -1;
             public int TotalColumn { get; set; } = -1;
+            // Index of the New Cut Disturbance column. When the source table
+            // lacks explicit headers (the default temporary areas table layout),
+            // this is mapped to column 7 so that new cut values propagate into
+            // the crown area usage summary.  For headered tables, this value
+            // remains -1 unless a header containing "NEW CUT" is detected.
+            public int NewCutColumn { get; set; } = -1;
         }
 
         private class WorkspaceTableEntry
@@ -521,6 +550,10 @@ namespace AreaManager.Services
             public double? ExistingDispositionHa { get; set; }
             public double? ExistingCutHa { get; set; }
             public double? TotalHa { get; set; }
+            // New cut disturbance (ha) for this workspace.  This value is read from
+            // the source table if present.  When absent, it will be computed as
+            // TotalHa - (ExistingCutHa + ExistingDispositionHa) in BuildWorkspaceAreaRow.
+            public double? NewCutHa { get; set; }
         }
     }
 }
