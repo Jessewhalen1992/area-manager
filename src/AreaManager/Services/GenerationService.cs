@@ -117,12 +117,30 @@ namespace AreaManager.Services
 
             foreach (var pair in pairs)
             {
-                var identifier = pair.Item1?.Trim() ?? string.Empty;
+                var identifierField = pair.Item1?.Trim() ?? string.Empty;
                 var enterText = pair.Item2?.Trim() ?? string.Empty;
 
-                var description = MapIdentifierDescription(identifier);
-                var row = BuildTempAreaRow(description, identifier, enterText);
-                rows.Add(row);
+                // Split the identifier field on whitespace to handle cases where multiple
+                // workspace IDs are specified in a single block (e.g. "W69 W70").  The
+                // original Excel macro duplicates the row for each ID and preserves the
+                // ENTER_TEXT value.  We replicate that behaviour here by generating a
+                // TempAreaRow for each individual identifier.
+                var identifiers = identifierField.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                if (identifiers.Length == 0)
+                {
+                    // No valid identifier; still produce a row with an empty ID
+                    var description = MapIdentifierDescription(identifierField);
+                    var row = BuildTempAreaRow(description, identifierField, enterText);
+                    rows.Add(row);
+                    continue;
+                }
+
+                foreach (var id in identifiers)
+                {
+                    var description = MapIdentifierDescription(id);
+                    var row = BuildTempAreaRow(description, id, enterText);
+                    rows.Add(row);
+                }
             }
 
             return rows
@@ -163,10 +181,10 @@ namespace AreaManager.Services
                 var parts = enterText.Split('x');
                 if (parts.Length >= 2)
                 {
-                    // Extract numbers from the portion before 'x' to determine the width.
-                    var widthNumbers = TextParsingService.ExtractAllNumbers(parts[0])?
-                        .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                    // Extract numbers from the portion after 'x' to determine the length and area.
+                    // Determine the width by taking the last numeric value from the portion
+                    // before 'x'.  The original Excel macro used ExtractLastNumber to pick
+                    // the final number from strings like "2-20.0" which should yield 20.0.
+                    var widthStr = TextParsingService.ExtractLastNumber(parts[0]);
                     var lengthNumbers = TextParsingService.ExtractAllNumbers(parts[1])?
                         .Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
 
@@ -174,9 +192,9 @@ namespace AreaManager.Services
                     double length = 0.0;
                     double? explicitArea = null;
 
-                    if (widthNumbers != null && widthNumbers.Length > 0)
+                    if (!string.IsNullOrWhiteSpace(widthStr))
                     {
-                        width = TextParsingService.ParseDoubleOrDefault(widthNumbers[0]);
+                        width = TextParsingService.ParseDoubleOrDefault(widthStr);
                     }
                     if (lengthNumbers != null && lengthNumbers.Length > 0)
                     {
@@ -406,10 +424,13 @@ namespace AreaManager.Services
             foreach (var row in rows)
             {
                 var description = MapIdentifierDescription(row.WorkspaceId);
+                // If the description could not be determined, use the workspace ID itself as the
+                // grouping key.  This prevents unknown identifiers from being collapsed into a
+                // single empty description bucket which would produce a blank row in the final
+                // table.  Using the workspace ID maintains a unique group per unknown entry.
                 if (string.IsNullOrWhiteSpace(description))
                 {
-                    // Default unknown identifiers to a generic bucket so they still contribute to totals
-                    description = "";
+                    description = row.WorkspaceId?.Trim() ?? string.Empty;
                 }
 
                 if (!groups.TryGetValue(description, out var agg))
@@ -442,25 +463,30 @@ namespace AreaManager.Services
                 });
             }
 
-            // Compute grand totals for the final row.  Only the TotalHa (and implicitly TotalAc)
-            // columns are populated; other fields remain zero so the summary displays blanks for
-            // within, outside, and disturbance values.  An empty WorkspaceId is used as a flag
-            // for TableService to treat this as the final totals row.
-            var grandTotalHa = result.Sum(r => r.TotalHa);
-            var grandExistingDisposition = result.Sum(r => r.ExistingDispositionHa);
-            var grandExistingCut = result.Sum(r => r.ExistingCutHa);
-            var grandExistingCutDist = result.Sum(r => r.ExistingCutDisturbanceHa);
-            var grandNewCutDist = result.Sum(r => r.NewCutDisturbanceHa);
-
-            result.Add(new WorkspaceAreaRow
+            // Append a grand total row only when there are multiple activity groups.
+            // When there is only a single activity type, the overall summary is omitted.
+            if (result.Count > 1)
             {
-                WorkspaceId = string.Empty,
-                ExistingCutHa = grandExistingCut,
-                ExistingDispositionHa = grandExistingDisposition,
-                TotalHa = grandTotalHa,
-                ExistingCutDisturbanceHa = grandExistingCutDist,
-                NewCutDisturbanceHa = grandNewCutDist
-            });
+                // Compute grand totals for the final row.  Only the TotalHa (and implicitly TotalAc)
+                // columns are populated; other fields remain zero so the summary displays blanks for
+                // within, outside, and disturbance values.  An empty WorkspaceId is used as a flag
+                // for TableService to treat this as the final totals row.
+                var grandTotalHa = result.Sum(r => r.TotalHa);
+                var grandExistingDisposition = result.Sum(r => r.ExistingDispositionHa);
+                var grandExistingCut = result.Sum(r => r.ExistingCutHa);
+                var grandExistingCutDist = result.Sum(r => r.ExistingCutDisturbanceHa);
+                var grandNewCutDist = result.Sum(r => r.NewCutDisturbanceHa);
+
+                result.Add(new WorkspaceAreaRow
+                {
+                    WorkspaceId = string.Empty,
+                    ExistingCutHa = grandExistingCut,
+                    ExistingDispositionHa = grandExistingDisposition,
+                    TotalHa = grandTotalHa,
+                    ExistingCutDisturbanceHa = grandExistingCutDist,
+                    NewCutDisturbanceHa = grandNewCutDist
+                });
+            }
 
             return result;
         }

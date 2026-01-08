@@ -143,6 +143,12 @@ namespace AreaManager.Services
                     table.Cells[i, 6].BackgroundColor = summaryColor;
                     table.Cells[i, 7].TextString = string.Empty;
                     table.Cells[i, 8].TextString = string.Empty;
+
+                    // Merge cells A–E (columns 0–4) into one cell and merge H–I (columns 7–8) into one cell
+                    // only for the summary row.  This replicates the requested layout where the
+                    // first five columns and the last two columns are merged in the totals row.
+                    table.MergeCells(CellRange.Create(table, i, 0, i, 4));
+                    table.MergeCells(CellRange.Create(table, i, 7, i, 8));
                 }
                 else
                 {
