@@ -36,5 +36,11 @@ namespace AreaManager
         {
             GenerationService.GenerateWorkspaceAreasTable();
         }
+
+        [CommandMethod("AMODSHAPES")]
+        public void AddObjectDataToShapes()
+        {
+            WorkspaceObjectDataService.AddObjectDataToShapes();
+        }
     }
 }

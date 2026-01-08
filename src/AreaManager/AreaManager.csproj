@@ -52,6 +52,7 @@
     <Compile Include="Services\GenerationService.cs" />
     <Compile Include="Services\TableService.cs" />
     <Compile Include="Services\TextParsingService.cs" />
+    <Compile Include="Services\WorkspaceObjectDataService.cs" />
     <Compile Include="Services\WorkspaceAreaService.cs" />
     <Compile Include="UI\MainForm.cs">
       <SubType>Form</SubType>
