@@ -20,5 +20,10 @@ namespace AreaManager.UI
         {
             GenerationService.GenerateWorkspaceAreasTable();
         }
+
+        private void addOdToShapesButton_Click(object sender, EventArgs e)
+        {
+            WorkspaceObjectDataService.AddObjectDataToShapes();
+        }
     }
 }

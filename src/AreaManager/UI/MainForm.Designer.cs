@@ -5,6 +5,7 @@ namespace AreaManager.UI
         private System.ComponentModel.IContainer components = null;
         private System.Windows.Forms.Button tempAreasButton;
         private System.Windows.Forms.Button workspaceAreasButton;
+        private System.Windows.Forms.Button addOdToShapesButton;
         private System.Windows.Forms.Label headerLabel;
 
         protected override void Dispose(bool disposing)
@@ -20,6 +21,7 @@ namespace AreaManager.UI
         {
             this.tempAreasButton = new System.Windows.Forms.Button();
             this.workspaceAreasButton = new System.Windows.Forms.Button();
+            this.addOdToShapesButton = new System.Windows.Forms.Button();
             this.headerLabel = new System.Windows.Forms.Label();
             this.SuspendLayout();
             // 
@@ -43,6 +45,16 @@ namespace AreaManager.UI
             this.workspaceAreasButton.UseVisualStyleBackColor = true;
             this.workspaceAreasButton.Click += new System.EventHandler(this.workspaceAreasButton_Click);
             // 
+            // addOdToShapesButton
+            // 
+            this.addOdToShapesButton.Location = new System.Drawing.Point(24, 160);
+            this.addOdToShapesButton.Name = "addOdToShapesButton";
+            this.addOdToShapesButton.Size = new System.Drawing.Size(234, 35);
+            this.addOdToShapesButton.TabIndex = 2;
+            this.addOdToShapesButton.Text = "Add OD To Shapes";
+            this.addOdToShapesButton.UseVisualStyleBackColor = true;
+            this.addOdToShapesButton.Click += new System.EventHandler(this.addOdToShapesButton_Click);
+            // 
             // headerLabel
             // 
             this.headerLabel.AutoSize = true;
@@ -57,8 +69,9 @@ namespace AreaManager.UI
             // 
             this.AutoScaleDimensions = new System.Drawing.SizeF(7F, 15F);
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
-            this.ClientSize = new System.Drawing.Size(284, 170);
+            this.ClientSize = new System.Drawing.Size(284, 215);
             this.Controls.Add(this.headerLabel);
+            this.Controls.Add(this.addOdToShapesButton);
             this.Controls.Add(this.workspaceAreasButton);
             this.Controls.Add(this.tempAreasButton);
             this.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog;
