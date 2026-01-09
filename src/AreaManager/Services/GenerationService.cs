@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
@@ -173,15 +174,15 @@ namespace AreaManager.Services
                         {
                             row.Width = "IRREGULAR";
                             row.Length = "IRREGULAR";
-                            row.AreaHa = explicitArea.Value.ToString("0.000");
+                            row.AreaHa = explicitArea.Value.ToString("0.000", CultureInfo.InvariantCulture);
                             row.ExistingCutDisturbance = row.AreaHa;
                             row.NewCutDisturbance = "0.000";
                             return row;
                         }
 
-                        row.Width = width.ToString("0.0");
-                        row.Length = length.ToString("0.0");
-                        row.AreaHa = computedArea.ToString("0.000");
+                        row.Width = width.ToString("0.0", CultureInfo.InvariantCulture);
+                        row.Length = length.ToString("0.0", CultureInfo.InvariantCulture);
+                        row.AreaHa = computedArea.ToString("0.000", CultureInfo.InvariantCulture);
                         row.ExistingCutDisturbance = row.AreaHa;
                         row.NewCutDisturbance = "0.000";
                         return row;
@@ -210,7 +211,7 @@ namespace AreaManager.Services
             if (IsNumeric(number))
             {
                 var area = TextParsingService.ParseDoubleOrDefault(number);
-                return area.ToString("0.000");
+                return area.ToString("0.000", CultureInfo.InvariantCulture);
             }
 
             return "N/A";
@@ -280,14 +281,6 @@ namespace AreaManager.Services
                 // Generate the layout under the final style.
                 table.GenerateLayout();
 
-                // If the style still merged the first row (title-like), undo it and regenerate.
-                var firstRow = table.Rows.Count > 0 ? table.Rows[0] : null;
-                if (firstRow?.IsMerged.HasValue == true && firstRow.IsMerged.Value)
-                {
-                    table.UnmergeCells(firstRow);
-                    table.GenerateLayout();
-                }
-
                 var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
                 var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
 
@@ -319,13 +312,6 @@ namespace AreaManager.Services
                 table.IsHeaderSuppressed = true;
 
                 table.GenerateLayout();
-
-                var first = table.Rows.Count > 0 ? table.Rows[0] : null;
-                if (first?.IsMerged.HasValue == true && first.IsMerged.Value)
-                {
-                    table.UnmergeCells(first);
-                    table.GenerateLayout();
-                }
 
                 var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
                 var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForWrite);
@@ -499,188 +485,276 @@ namespace AreaManager.Services
                 var odTables = mapApp.ActiveProject.ODTables;
                 if (!odTables.IsTableDefined(WorkspaceTableName))
                 {
+                    // No OD table configured; leave default values.
                     return true;
                 }
 
-                var odTable = odTables[WorkspaceTableName];
-
-                var boundaryMap = new Dictionary<string, ObjectId>(StringComparer.OrdinalIgnoreCase);
-                var duplicateIds = new List<ObjectId>();
-
-                var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
-                var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForRead);
-
-                var fieldIndex = FindFieldIndex(odTable.FieldDefinitions, WorkspaceFieldName);
-                if (fieldIndex < 0)
+                // IMPORTANT (stability): Object Data tables/records are COM-backed wrappers.
+                // Not disposing them will leak unmanaged memory and can lead to fatal crashes
+                // after the tool has been run a few times.
+                using (var odTable = odTables[WorkspaceTableName])
                 {
-                    return true;
-                }
-
-                // Build boundary map and detect duplicates (DISPOSE OD WRAPPERS!)
-                foreach (ObjectId objectId in modelSpace)
-                {
-                    var entity = transaction.GetObject(objectId, OpenMode.ForRead) as Entity;
-                    if (entity == null)
+                    var fieldIndex = FindFieldIndex(odTable.FieldDefinitions, WorkspaceFieldName);
+                    if (fieldIndex < 0)
                     {
-                        continue;
+                        return true;
                     }
 
-                    var layerName = entity.Layer ?? string.Empty;
-                    if (layerName.Equals("P-EXISTINGCUT", StringComparison.OrdinalIgnoreCase) ||
-                        layerName.Equals("P-EXISTINGDISPO", StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
+                    var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
+                    var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForRead);
 
-                    try
+                    var boundaryMap = new Dictionary<string, ObjectId>(StringComparer.OrdinalIgnoreCase);
+                    var boundaryAreaHaMap = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+                    var duplicateIds = new List<ObjectId>();
+
+                    // Build the boundary map and detect duplicates.
+                    foreach (ObjectId objectId in modelSpace)
                     {
-                        using (var records = odTable.GetObjectTableRecords(0, entity, MapOpenMode.OpenForRead, false))
+                        var entity = transaction.GetObject(objectId, OpenMode.ForRead) as Entity;
+                        if (entity == null)
                         {
-                            if (records == null || records.Count == 0)
-                            {
-                                continue;
-                            }
+                            continue;
+                        }
 
-                            var record = records[0];
-                            var mapValue = record[fieldIndex];
-                            if (mapValue == null)
-                            {
-                                continue;
-                            }
+                        // Skip cut/disposition layers; we only care about boundary shapes here.
+                        var layerName = entity.Layer ?? string.Empty;
+                        if (layerName.Equals("P-EXISTINGCUT", StringComparison.OrdinalIgnoreCase) ||
+                            layerName.Equals("P-EXISTINGDISPO", StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
 
-                            using (mapValue) // MapValue is a DisposableWrapper
+                        try
+                        {
+                            using (var records = odTable.GetObjectTableRecords(0, entity, MapOpenMode.OpenForRead, false))
                             {
-                                var value = mapValue.StrValue;
-                                if (string.IsNullOrWhiteSpace(value))
+                                if (records == null || records.Count == 0)
                                 {
                                     continue;
                                 }
 
-                                var key = value.Trim();
-                                if (boundaryMap.ContainsKey(key))
+                                var record = records[0];
+                                var mapValue = record[fieldIndex];
+                                if (mapValue == null)
                                 {
-                                    duplicateIds.Add(objectId);
-                                    duplicateIds.Add(boundaryMap[key]);
+                                    continue;
                                 }
-                                else
+
+                                using (mapValue)
                                 {
+                                    var value = mapValue.StrValue;
+                                    if (string.IsNullOrWhiteSpace(value))
+                                    {
+                                        continue;
+                                    }
+
+                                    var key = value.Trim();
+                                    if (boundaryMap.ContainsKey(key))
+                                    {
+                                        duplicateIds.Add(objectId);
+                                        duplicateIds.Add(boundaryMap[key]);
+                                        continue;
+                                    }
+
                                     boundaryMap[key] = objectId;
+
+                                    // Cache the boundary's true area (from geometry) so we can
+                                    // (a) use it for totals/new cut calculations and
+                                    // (b) decide whether "Within Disposition" should be YES.
+                                    if (TryGetEntityAreaHa(entity, out var boundaryAreaHa) && boundaryAreaHa > 0.0)
+                                    {
+                                        boundaryAreaHaMap[key] = boundaryAreaHa;
+                                    }
                                 }
                             }
                         }
-                    }
-                    catch
-                    {
-                        // Some entities/OD configurations can throw; ignore and continue.
-                        continue;
-                    }
-                }
-
-                if (duplicateIds.Count > 0)
-                {
-                    var distinct = duplicateIds.Distinct().ToArray();
-                    editor.SetImpliedSelection(distinct);
-                    editor.WriteMessage("\nDuplicate workspace boundaries detected. Please resolve duplicates and retry.");
-                    return false;
-                }
-
-                // Precompute cut/disposition entities
-                var cutEntities = new List<Tuple<ObjectId, string>>();
-                foreach (ObjectId objectId in modelSpace)
-                {
-                    var entity = transaction.GetObject(objectId, OpenMode.ForRead) as Entity;
-                    if (entity == null) continue;
-
-                    var ln = entity.Layer ?? string.Empty;
-                    if (ln.Equals("P-EXISTINGCUT", StringComparison.OrdinalIgnoreCase) ||
-                        ln.Equals("P-EXISTINGDISPO", StringComparison.OrdinalIgnoreCase))
-                    {
-                        cutEntities.Add(Tuple.Create(objectId, ln));
-                    }
-                }
-
-                foreach (var row in rows)
-                {
-                    double withinDispositionHa = 0.0;
-                    double existingCutHa = 0.0;
-
-                    if (boundaryMap.TryGetValue(row.Identifier?.Trim() ?? string.Empty, out var boundaryId))
-                    {
-                        var boundaryEntity = transaction.GetObject(boundaryId, OpenMode.ForRead) as Entity;
-                        if (boundaryEntity != null)
+                        catch
                         {
-                            Extents3d boundaryExtents;
-                            try
-                            {
-                                boundaryExtents = boundaryEntity.GeometricExtents;
-                            }
-                            catch
-                            {
-                                boundaryExtents = new Extents3d();
-                            }
+                            // Some entities/OD configurations can throw; ignore and continue.
+                            continue;
+                        }
+                    }
 
-                            foreach (var tuple in cutEntities)
+                    if (duplicateIds.Count > 0)
+                    {
+                        var distinct = duplicateIds.Distinct().ToArray();
+                        editor.SetImpliedSelection(distinct);
+                        editor.WriteMessage("\nDuplicate workspace boundaries detected. Please resolve duplicates and retry.");
+                        return false;
+                    }
+
+                    // Precompute cut/disposition entities.
+                    var cutEntities = new List<Tuple<ObjectId, string>>();
+                    foreach (ObjectId objectId in modelSpace)
+                    {
+                        var entity = transaction.GetObject(objectId, OpenMode.ForRead) as Entity;
+                        if (entity == null)
+                        {
+                            continue;
+                        }
+
+                        var ln = entity.Layer ?? string.Empty;
+                        if (ln.Equals("P-EXISTINGCUT", StringComparison.OrdinalIgnoreCase) ||
+                            ln.Equals("P-EXISTINGDISPO", StringComparison.OrdinalIgnoreCase))
+                        {
+                            cutEntities.Add(Tuple.Create(objectId, ln));
+                        }
+                    }
+
+                    // Process each temporary row.
+                    foreach (var row in rows)
+                    {
+                        var workspaceId = row.Identifier?.Trim() ?? string.Empty;
+
+                        double withinDispositionHa = 0.0;
+                        double existingCutDisturbanceHa = 0.0;
+                        double boundaryAreaHa = 0.0;
+
+                        if (boundaryMap.TryGetValue(workspaceId, out var boundaryId))
+                        {
+                            boundaryAreaHaMap.TryGetValue(workspaceId, out boundaryAreaHa);
+
+                            var boundaryEntity = transaction.GetObject(boundaryId, OpenMode.ForRead) as Entity;
+                            if (boundaryEntity != null)
                             {
-                                var entId = tuple.Item1;
-                                var ln = tuple.Item2;
+                                // If we couldn't compute the boundary area during the map build (e.g. region creation failed then),
+                                // try again now.
+                                if (boundaryAreaHa <= 0.0)
+                                {
+                                    TryGetEntityAreaHa(boundaryEntity, out boundaryAreaHa);
+                                }
 
-                                var ent = transaction.GetObject(entId, OpenMode.ForRead) as Entity;
-                                if (ent == null) continue;
-
-                                Extents3d shapeExtents;
+                                Extents3d boundaryExtents;
                                 try
                                 {
-                                    shapeExtents = ent.GeometricExtents;
+                                    boundaryExtents = boundaryEntity.GeometricExtents;
                                 }
                                 catch
                                 {
-                                    continue;
+                                    boundaryExtents = new Extents3d();
                                 }
 
-                                bool inside =
-                                    shapeExtents.MinPoint.X >= boundaryExtents.MinPoint.X &&
-                                    shapeExtents.MinPoint.Y >= boundaryExtents.MinPoint.Y &&
-                                    shapeExtents.MaxPoint.X <= boundaryExtents.MaxPoint.X &&
-                                    shapeExtents.MaxPoint.Y <= boundaryExtents.MaxPoint.Y;
-
-                                if (!inside)
+                                foreach (var tuple in cutEntities)
                                 {
-                                    continue;
-                                }
+                                    var entId = tuple.Item1;
+                                    var ln = tuple.Item2;
 
-                                double areaSq = 0.0;
-                                using (var shapeRegion = CreateRegionFromEntity(ent))
-                                {
-                                    if (shapeRegion != null)
+                                    var ent = transaction.GetObject(entId, OpenMode.ForRead) as Entity;
+                                    if (ent == null)
                                     {
-                                        areaSq = Math.Abs(shapeRegion.Area);
+                                        continue;
                                     }
-                                }
 
-                                if (areaSq <= 0.0) continue;
+                                    Extents3d shapeExtents;
+                                    try
+                                    {
+                                        shapeExtents = ent.GeometricExtents;
+                                    }
+                                    catch
+                                    {
+                                        continue;
+                                    }
 
-                                double areaHa = areaSq / 10000.0;
-                                existingCutHa += areaHa;
+                                    // Cheap inclusion test: extents fully inside extents.
+                                    bool inside =
+                                        shapeExtents.MinPoint.X >= boundaryExtents.MinPoint.X &&
+                                        shapeExtents.MinPoint.Y >= boundaryExtents.MinPoint.Y &&
+                                        shapeExtents.MaxPoint.X <= boundaryExtents.MaxPoint.X &&
+                                        shapeExtents.MaxPoint.Y <= boundaryExtents.MaxPoint.Y;
 
-                                if (ln.Equals("P-EXISTINGDISPO", StringComparison.OrdinalIgnoreCase))
-                                {
-                                    withinDispositionHa += areaHa;
+                                    if (!inside)
+                                    {
+                                        continue;
+                                    }
+
+                                    if (!TryGetEntityAreaHa(ent, out var shapeAreaHa) || shapeAreaHa <= 0.0)
+                                    {
+                                        continue;
+                                    }
+
+                                    existingCutDisturbanceHa += shapeAreaHa;
+                                    if (ln.Equals("P-EXISTINGDISPO", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        withinDispositionHa += shapeAreaHa;
+                                    }
                                 }
                             }
                         }
+
+                        // Use boundary shape area (if available) for totals so we don't depend on the block text math.
+                        var totalAreaHa = boundaryAreaHa > 0.0
+                            ? boundaryAreaHa
+                            : TextParsingService.ParseDoubleOrDefault(row.AreaHa);
+
+                        // Keep the displayed "Area" in sync with what we actually used for totals.
+                        if (boundaryAreaHa > 0.0)
+                        {
+                            row.AreaHa = boundaryAreaHa.ToString("0.000", CultureInfo.InvariantCulture);
+                        }
+
+                        var newCutHa = totalAreaHa - existingCutDisturbanceHa;
+                        if (newCutHa < 0.0)
+                        {
+                            newCutHa = 0.0;
+                        }
+
+                        // WITHIN DISPOSITION display rules:
+                        // - 0.000 => "No"
+                        // - matches the boundary shape area (3dp) => "Yes"
+                        // - otherwise show the area (3dp)
+                        var withinText = withinDispositionHa.ToString("0.000", CultureInfo.InvariantCulture);
+                        if (withinText == "0.000")
+                        {
+                            row.WithinExistingDisposition = "No";
+                        }
+                        else
+                        {
+                            var boundaryText = boundaryAreaHa > 0.0
+                                ? boundaryAreaHa.ToString("0.000", CultureInfo.InvariantCulture)
+                                : null;
+
+                            row.WithinExistingDisposition =
+                                !string.IsNullOrEmpty(boundaryText) && withinText == boundaryText
+                                    ? "Yes"
+                                    : withinText;
+                        }
+
+                        row.ExistingCutDisturbance = existingCutDisturbanceHa.ToString("0.000", CultureInfo.InvariantCulture);
+                        row.NewCutDisturbance = newCutHa.ToString("0.000", CultureInfo.InvariantCulture);
                     }
-
-                    var totalAreaHa = TextParsingService.ParseDoubleOrDefault(row.AreaHa);
-                    var newCutHa = totalAreaHa - existingCutHa;
-                    if (newCutHa < 0) newCutHa = 0.0;
-
-                    row.WithinExistingDisposition = withinDispositionHa.ToString("0.000");
-                    row.ExistingCutDisturbance = existingCutHa.ToString("0.000");
-                    row.NewCutDisturbance = newCutHa.ToString("0.000");
                 }
             }
 
             return true;
+        }
+
+        private static bool TryGetEntityAreaHa(Entity entity, out double areaHa)
+        {
+            areaHa = 0.0;
+
+            try
+            {
+                using (var region = CreateRegionFromEntity(entity))
+                {
+                    if (region == null)
+                    {
+                        return false;
+                    }
+
+                    var areaSq = Math.Abs(region.Area);
+                    if (areaSq <= 0.0)
+                    {
+                        return false;
+                    }
+
+                    areaHa = areaSq / 10000.0;
+                    return areaHa > 0.0;
+                }
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         private static Region CreateRegionFromEntity(Entity entity)

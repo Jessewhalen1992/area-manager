@@ -8,7 +8,7 @@ using Autodesk.Gis.Map;
 using Autodesk.Gis.Map.ObjectData;
 using MapOpenMode = Autodesk.Gis.Map.Constants.OpenMode;
 
-// Explicit aliases help avoid confusion with AutoCAD DatabaseServices.Table
+// Explicit aliases to avoid confusion with AutoCAD Table
 using OdTable = Autodesk.Gis.Map.ObjectData.Table;
 using OdRecord = Autodesk.Gis.Map.ObjectData.Record;
 using OdRecords = Autodesk.Gis.Map.ObjectData.Records;
@@ -37,50 +37,89 @@ namespace AreaManager.Services
         public static void AddObjectDataToShapes()
         {
             var document = Application.DocumentManager.MdiActiveDocument;
+            if (document == null)
+            {
+                return;
+            }
+
             var editor = document.Editor;
             var database = document.Database;
 
-            var activityResult = editor.GetString(new PromptStringOptions("\nWhat type of Activity? (W) (LD) etc: ")
+            // IMPORTANT: called from WinForms button (modeless) -> lock doc
+            using (document.LockDocument())
             {
-                AllowSpaces = false
-            });
-
-            if (activityResult.Status != PromptStatus.OK)
-            {
-                editor.WriteMessage("\nOperation cancelled.");
-                return;
-            }
-
-            var activityPrefix = activityResult.StringResult?.Trim();
-            if (string.IsNullOrWhiteSpace(activityPrefix))
-            {
-                editor.WriteMessage("\nActivity type is required. Operation cancelled.");
-                return;
-            }
-
-            var polylineOptions = new PromptEntityOptions("\nSelect a Polyline: ");
-            polylineOptions.SetRejectMessage("\nOnly polylines are supported.");
-            polylineOptions.AddAllowedClass(typeof(Polyline), true);
-            polylineOptions.AddAllowedClass(typeof(Polyline2d), true);
-            polylineOptions.AddAllowedClass(typeof(Polyline3d), true);
-
-            var polylineResult = editor.GetEntity(polylineOptions);
-            if (polylineResult.Status != PromptStatus.OK)
-            {
-                editor.WriteMessage("\nOperation cancelled.");
-                return;
-            }
-
-            using (var transaction = database.TransactionManager.StartTransaction())
-            {
-                var polylineEntity = transaction.GetObject(polylineResult.ObjectId, OpenMode.ForRead) as Entity;
-                var vertices = ExtractPolylineVertices(transaction, polylineEntity);
-                if (vertices.Count == 0)
+                // 1) Ask for prefix
+                var activityResult = editor.GetString(new PromptStringOptions("\nWhat type of Activity? (W) (LD) etc: ")
                 {
-                    editor.WriteMessage("\nNo vertices found on the selected polyline.");
+                    AllowSpaces = false
+                });
+
+                if (activityResult.Status != PromptStatus.OK)
+                {
+                    editor.WriteMessage("\nOperation cancelled.");
                     return;
                 }
 
+                var activityPrefix = (activityResult.StringResult ?? string.Empty).Trim();
+                if (string.IsNullOrWhiteSpace(activityPrefix))
+                {
+                    editor.WriteMessage("\nActivity type is required. Operation cancelled.");
+                    return;
+                }
+
+                // 2) Select the polyline providing the vertex order
+                var polylineOptions = new PromptEntityOptions("\nSelect a Polyline: ");
+                polylineOptions.SetRejectMessage("\nOnly polylines are supported.");
+                polylineOptions.AddAllowedClass(typeof(Polyline), true);
+                polylineOptions.AddAllowedClass(typeof(Polyline2d), true);
+                polylineOptions.AddAllowedClass(typeof(Polyline3d), true);
+
+                var polylineResult = editor.GetEntity(polylineOptions);
+                if (polylineResult.Status != PromptStatus.OK)
+                {
+                    editor.WriteMessage("\nOperation cancelled.");
+                    return;
+                }
+
+                // ------------------------------------------------------------
+                // READ PHASE: compute vertices, candidates, and assignments
+                // ------------------------------------------------------------
+                List<Point3d> vertices;
+                List<ObjectId> candidateIds;
+                Dictionary<ObjectId, string> assignments;
+
+                using (var readTr = database.TransactionManager.StartTransaction())
+                {
+                    var polylineEntity = readTr.GetObject(polylineResult.ObjectId, OpenMode.ForRead) as Entity;
+                    vertices = ExtractPolylineVertices(readTr, polylineEntity);
+
+                    if (vertices.Count == 0)
+                    {
+                        editor.WriteMessage("\nNo vertices found on the selected polyline.");
+                        return;
+                    }
+
+                    candidateIds = CollectCandidateShapeIds(readTr, database);
+                    if (candidateIds.Count == 0)
+                    {
+                        editor.WriteMessage("\nNo closed shapes found on the expected layers.");
+                        return;
+                    }
+
+                    // Build assignments based on vertex order
+                    assignments = BuildAssignmentsFromVertices(readTr, editor, candidateIds, vertices, activityPrefix);
+                    if (assignments == null)
+                    {
+                        // already wrote message
+                        return;
+                    }
+
+                    readTr.Commit();
+                }
+
+                // ------------------------------------------------------------
+                // WRITE PHASE: clear then rewrite OD values
+                // ------------------------------------------------------------
                 var mapApp = HostMapApplicationServices.Application;
                 var odTables = mapApp.ActiveProject.ODTables;
 
@@ -90,7 +129,13 @@ namespace AreaManager.Services
                     return;
                 }
 
-                // ObjectData.Table is a DisposableWrapper; dispose it when you're done.
+                int clearedCount = 0;
+                int updatedCount = 0;
+                int createdCount = 0;
+                int writeFailCount = 0;
+                int clearFailCount = 0;
+
+                using (var writeTr = database.TransactionManager.StartTransaction())
                 using (OdTable odTable = odTables[WorkspaceTableName])
                 {
                     var fieldIndex = FindFieldIndex(odTable.FieldDefinitions, WorkspaceFieldName);
@@ -100,133 +145,98 @@ namespace AreaManager.Services
                         return;
                     }
 
-                    var candidates = CollectCandidateShapes(transaction, database);
-                    if (candidates.Count == 0)
+                    // Pass 1: clear all OD values that start with the prefix on candidate shapes
+                    foreach (var id in candidateIds)
                     {
-                        editor.WriteMessage("\nNo closed shapes found on the expected layers.");
-                        return;
-                    }
-
-                    // assignments: entity -> WORKSPACENUM value
-                    var assignments = new Dictionary<ObjectId, string>();
-                    var matchedIds = new HashSet<ObjectId>();
-
-                    for (var index = 0; index < vertices.Count; index++)
-                    {
-                        var vertexNumber = index + 1;
-                        var targetValue = $"{activityPrefix}{vertexNumber}";
-                        var matches = new List<ObjectId>();
-
-                        var testPoint = vertices[index];
-
-                        foreach (var candidate in candidates)
+                        var clearResult = TryClearPrefixValue(writeTr, odTable, id, fieldIndex, activityPrefix);
+                        if (clearResult == ClearResult.Cleared)
                         {
-                            if (!IsPointInsideClosedCurve(candidate.Curve, testPoint))
-                            {
-                                continue;
-                            }
-
-                            matches.Add(candidate.ObjectId);
+                            clearedCount++;
                         }
-
-                        if (matches.Count == 0)
+                        else if (clearResult == ClearResult.Failed)
                         {
-                            editor.WriteMessage($"\nNo closed shape found for vertex {vertexNumber}. Operation cancelled.");
-                            return;
-                        }
-
-                        foreach (var objectId in matches)
-                        {
-                            assignments[objectId] = targetValue;
-                            matchedIds.Add(objectId);
+                            clearFailCount++;
                         }
                     }
 
-                    // Apply OD values to matched shapes
-                    foreach (var assignment in assignments)
+                    // Pass 2: write the new assignments in vertex order (creates OD for new shapes)
+                    foreach (var kvp in assignments)
                     {
-                        var entity = transaction.GetObject(assignment.Key, OpenMode.ForRead) as Entity;
-                        if (entity == null)
+                        var writeResult = TryWriteValue(writeTr, odTable, kvp.Key, fieldIndex, kvp.Value);
+                        if (writeResult == WriteResult.Updated)
                         {
-                            continue;
+                            updatedCount++;
                         }
-
-                        using (OdRecords records = odTable.GetObjectTableRecords(
-                                   0, entity.ObjectId, MapOpenMode.OpenForWrite, false))
+                        else if (writeResult == WriteResult.Created)
                         {
-                            if (records == null || records.Count == 0)
-                            {
-                                // Cross-version pattern:
-                                // Record.Create() + Table.InitRecord() + AddRecord()
-                                // (works for Map 3D 2015/2025 per Autodesk Map .NET dev guide) :contentReference[oaicite:1]{index=1}
-                                using (OdRecord record = OdRecord.Create())
-                                {
-                                    odTable.InitRecord(record);
-
-                                    using (var mapValue = record[fieldIndex])
-                                    {
-                                        mapValue.Assign(assignment.Value);
-                                    }
-
-                                    // Use ObjectId overload for best compatibility
-                                    odTable.AddRecord(record, entity.ObjectId);
-                                }
-                            }
-                            else
-                            {
-                                var recordToUpdate = records[0];
-                                using (var mapValue = recordToUpdate[fieldIndex])
-                                {
-                                    mapValue.Assign(assignment.Value);
-                                }
-
-                                // Persist the update (recommended by Map OD docs) :contentReference[oaicite:2]{index=2}
-                                records.UpdateRecord(recordToUpdate);
-                            }
+                            createdCount++;
+                        }
+                        else if (writeResult == WriteResult.Failed)
+                        {
+                            writeFailCount++;
                         }
                     }
 
-                    // Clear OD values for shapes on valid layers that were NOT matched (only if they start with activityPrefix)
-                    var prefixComparison = StringComparison.OrdinalIgnoreCase;
-                    foreach (var candidate in candidates)
-                    {
-                        if (matchedIds.Contains(candidate.ObjectId))
-                        {
-                            continue;
-                        }
-
-                        var entity = transaction.GetObject(candidate.ObjectId, OpenMode.ForRead) as Entity;
-                        if (entity == null)
-                        {
-                            continue;
-                        }
-
-                        using (OdRecords records = odTable.GetObjectTableRecords(
-                                   0, entity.ObjectId, MapOpenMode.OpenForWrite, false))
-                        {
-                            if (records == null || records.Count == 0)
-                            {
-                                continue;
-                            }
-
-                            var recordToUpdate = records[0];
-                            using (var mapValue = recordToUpdate[fieldIndex])
-                            {
-                                var currentValue = mapValue.StrValue ?? string.Empty;
-                                if (currentValue.StartsWith(activityPrefix, prefixComparison))
-                                {
-                                    mapValue.Assign(string.Empty);
-                                    records.UpdateRecord(recordToUpdate);
-                                }
-                            }
-                        }
-                    }
-
-                    editor.WriteMessage($"\nUpdated {assignments.Count} shape(s) with {activityPrefix} values.");
+                    writeTr.Commit();
                 }
 
-                transaction.Commit();
+                editor.WriteMessage(
+                    $"\nCleared {clearedCount} shape(s) with values starting '{activityPrefix}'. " +
+                    $"Updated {updatedCount}, Created {createdCount} new OD record(s).");
+
+                if (writeFailCount > 0 || clearFailCount > 0)
+                {
+                    editor.WriteMessage(
+                        $"\nWarning: {clearFailCount} clear failures, {writeFailCount} write failures. " +
+                        "Common causes: layer locked, entity on an xref, or object not writeable.");
+                }
             }
+        }
+
+        private static Dictionary<ObjectId, string> BuildAssignmentsFromVertices(
+            Transaction tr,
+            Editor editor,
+            List<ObjectId> candidateIds,
+            List<Point3d> vertices,
+            string activityPrefix)
+        {
+            var assignments = new Dictionary<ObjectId, string>();
+
+            for (int i = 0; i < vertices.Count; i++)
+            {
+                var vertexNumber = i + 1;
+                var targetValue = activityPrefix + vertexNumber;
+                var point = vertices[i];
+
+                var matches = new List<ObjectId>();
+
+                for (int c = 0; c < candidateIds.Count; c++)
+                {
+                    var candidateId = candidateIds[c];
+                    if (!IsPointInsideClosedCurve(tr, candidateId, point))
+                    {
+                        continue;
+                    }
+
+                    matches.Add(candidateId);
+                }
+
+                if (matches.Count == 0)
+                {
+                    editor.WriteMessage($"\nNo closed shape found for vertex {vertexNumber}. Operation cancelled.");
+                    return null;
+                }
+
+                // If multiple shapes contain the point, all get the same value.
+                // (If you want EXACTLY one shape per vertex, say so and I’ll switch
+                // to “smallest-area containing shape”.)
+                foreach (var id in matches)
+                {
+                    assignments[id] = targetValue;
+                }
+            }
+
+            return assignments;
         }
 
         private static List<Point3d> ExtractPolylineVertices(Transaction transaction, Entity polylineEntity)
@@ -272,9 +282,9 @@ namespace AreaManager.Services
             return vertices;
         }
 
-        private static List<ShapeCandidate> CollectCandidateShapes(Transaction transaction, Database database)
+        private static List<ObjectId> CollectCandidateShapeIds(Transaction transaction, Database database)
         {
-            var candidates = new List<ShapeCandidate>();
+            var candidates = new List<ObjectId>();
 
             var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
             var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForRead);
@@ -292,57 +302,53 @@ namespace AreaManager.Services
                     continue;
                 }
 
-                if (entity is Curve curve && curve.Closed)
+                var curve = entity as Curve;
+                if (curve != null && curve.Closed)
                 {
-                    candidates.Add(new ShapeCandidate(objectId, curve));
+                    candidates.Add(objectId);
                 }
             }
 
             return candidates;
         }
 
-        /// <summary>
-        /// Cross-version point-in-closed-curve test (AutoCAD 2015+).
-        /// AutoCAD DatabaseServices.Curve does NOT have GetPointContainment().
-        /// We implement a robust even/odd ray test using IntersectWith.
-        /// </summary>
-        private static bool IsPointInsideClosedCurve(Curve curve, Point3d point)
+        private static bool IsPointInsideClosedCurve(Transaction tr, ObjectId curveId, Point3d point)
         {
-            if (curve == null || !curve.Closed)
+            try
             {
-                return false;
-            }
-
-            // Quick extents check (cheap reject)
-            Extents3d extents;
-            bool hasExtents = TryGetExtents(curve, out extents);
-            if (hasExtents)
-            {
-                if (point.X < extents.MinPoint.X || point.X > extents.MaxPoint.X ||
-                    point.Y < extents.MinPoint.Y || point.Y > extents.MaxPoint.Y)
+                var curve = tr.GetObject(curveId, OpenMode.ForRead) as Curve;
+                if (curve == null || !curve.Closed)
                 {
                     return false;
                 }
-            }
 
-            // Treat "on boundary" as inside (closest point distance <= tolerance)
-            try
-            {
-                var closest = curve.GetClosestPointTo(point, false);
-                if (closest.DistanceTo(point) <= Tolerance.Global.EqualPoint)
+                // Quick extents reject
+                Extents3d extents;
+                bool hasExtents = TryGetExtents(curve, out extents);
+                if (hasExtents)
                 {
-                    return true;
+                    if (point.X < extents.MinPoint.X || point.X > extents.MaxPoint.X ||
+                        point.Y < extents.MinPoint.Y || point.Y > extents.MaxPoint.Y)
+                    {
+                        return false;
+                    }
                 }
-            }
-            catch
-            {
-                // ignore and continue to ray test
-            }
 
-            // Ray cast: count intersections with a long line starting at the point.
-            // If odd => inside, if even => outside.
-            try
-            {
+                // On-boundary -> inside
+                try
+                {
+                    var closest = curve.GetClosestPointTo(point, false);
+                    if (closest.DistanceTo(point) <= Tolerance.Global.EqualPoint)
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // continue
+                }
+
+                // Ray cast
                 double farX;
                 double farY;
 
@@ -355,8 +361,6 @@ namespace AreaManager.Services
                     if (height < 1.0) height = 1.0;
 
                     farX = extents.MaxPoint.X + width + 10.0;
-
-                    // Offset Y a bit to reduce the chance of the ray going exactly through a vertex
                     farY = point.Y + (height * 0.1234567);
                 }
                 else
@@ -380,28 +384,25 @@ namespace AreaManager.Services
                         return false;
                     }
 
-                    // Remove duplicates / near-start hits
                     double tol = Math.Max(Tolerance.Global.EqualPoint, 1e-7);
-
                     var unique = new List<Point3d>();
+
                     foreach (Point3d hit in hits)
                     {
-                        // Ignore hits extremely close to the start point
                         if (hit.DistanceTo(point) <= tol)
                         {
                             continue;
                         }
 
-                        // Only count hits "in front" of the start (primarily along +X direction)
                         if (hit.X < point.X - tol)
                         {
                             continue;
                         }
 
                         bool already = false;
-                        foreach (var u in unique)
+                        for (int i = 0; i < unique.Count; i++)
                         {
-                            if (u.DistanceTo(hit) <= tol)
+                            if (unique[i].DistanceTo(hit) <= tol)
                             {
                                 already = true;
                                 break;
@@ -442,6 +443,119 @@ namespace AreaManager.Services
             }
         }
 
+        private enum ClearResult
+        {
+            NotCleared,
+            Cleared,
+            Failed
+        }
+
+        /// <summary>
+        /// Clears WORKSPACENUM value if it starts with the given prefix.
+        /// IMPORTANT: opens entity ForWrite and uses entity overload of GetObjectTableRecords.
+        /// </summary>
+        private static ClearResult TryClearPrefixValue(Transaction tr, OdTable odTable, ObjectId objectId, int fieldIndex, string prefix)
+        {
+            try
+            {
+                var entity = tr.GetObject(objectId, OpenMode.ForWrite) as Entity;
+                if (entity == null)
+                {
+                    return ClearResult.Failed;
+                }
+
+                using (OdRecords records = odTable.GetObjectTableRecords(0, entity, MapOpenMode.OpenForWrite, false))
+                {
+                    if (records == null || records.Count == 0)
+                    {
+                        return ClearResult.NotCleared;
+                    }
+
+                    bool clearedAny = false;
+
+                    foreach (OdRecord rec in records)
+                    {
+                        using (var mapValue = rec[fieldIndex])
+                        {
+                            var current = mapValue.StrValue ?? string.Empty;
+                            if (!string.IsNullOrEmpty(current) &&
+                                current.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                            {
+                                mapValue.Assign(string.Empty);
+                                records.UpdateRecord(rec);
+                                clearedAny = true;
+                            }
+                        }
+                    }
+
+                    return clearedAny ? ClearResult.Cleared : ClearResult.NotCleared;
+                }
+            }
+            catch
+            {
+                return ClearResult.Failed;
+            }
+        }
+
+        private enum WriteResult
+        {
+            None,
+            Updated,
+            Created,
+            Failed
+        }
+
+        /// <summary>
+        /// Writes WORKSPACENUM value to the object (creates a record if needed).
+        /// IMPORTANT: opens entity ForWrite and uses entity overload of GetObjectTableRecords / AddRecord.
+        /// </summary>
+        private static WriteResult TryWriteValue(Transaction tr, OdTable odTable, ObjectId objectId, int fieldIndex, string value)
+        {
+            try
+            {
+                var entity = tr.GetObject(objectId, OpenMode.ForWrite) as Entity;
+                if (entity == null)
+                {
+                    return WriteResult.Failed;
+                }
+
+                using (OdRecords records = odTable.GetObjectTableRecords(0, entity, MapOpenMode.OpenForWrite, false))
+                {
+                    if (records == null || records.Count == 0)
+                    {
+                        using (OdRecord record = OdRecord.Create())
+                        {
+                            odTable.InitRecord(record);
+
+                            using (var mapValue = record[fieldIndex])
+                            {
+                                mapValue.Assign(value);
+                            }
+
+                            // This is the key change: attach OD via the ENTITY (opened ForWrite)
+                            odTable.AddRecord(record, entity);
+
+                            return WriteResult.Created;
+                        }
+                    }
+
+                    // Update first record (typical case: exactly one record)
+                    var recToUpdate = records[0];
+                    using (var mapValue = recToUpdate[fieldIndex])
+                    {
+                        mapValue.Assign(value);
+                    }
+
+                    records.UpdateRecord(recToUpdate);
+                    return WriteResult.Updated;
+                }
+            }
+            catch
+            {
+                return WriteResult.Failed;
+            }
+        }
+
         private static int FindFieldIndex(FieldDefinitions fieldDefinitions, string fieldName)
         {
             for (var index = 0; index < fieldDefinitions.Count; index++)
@@ -454,18 +568,6 @@ namespace AreaManager.Services
             }
 
             return -1;
-        }
-
-        private class ShapeCandidate
-        {
-            public ShapeCandidate(ObjectId objectId, Curve curve)
-            {
-                ObjectId = objectId;
-                Curve = curve;
-            }
-
-            public ObjectId ObjectId { get; }
-            public Curve Curve { get; }
         }
     }
 }

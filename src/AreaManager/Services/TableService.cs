@@ -20,6 +20,18 @@ namespace AreaManager.Services
                 Position = insertionPoint
             };
 
+            // Same reasoning as CreateTempAreaTable: keep AutoCAD from treating row 0/1 as
+            // title/header rows when styles are applied later.
+            table.IsTitleSuppressed = true;
+            table.IsHeaderSuppressed = true;
+
+            // IMPORTANT (2015/2025): Suppress the built-in title/header rows BEFORE calling
+            // SetSize() / touching Cells[]. If we size/fill first, AutoCAD can treat row 0/1
+            // as Title/Header (depending on style), which can lead to unexpected merges and
+            // even fatal errors when styles are applied later.
+            table.IsTitleSuppressed = true;
+            table.IsHeaderSuppressed = true;
+
             // Convert the enumerable to a list for efficient indexing and counting
             var rowList = new List<TempAreaRow>(rows ?? Array.Empty<TempAreaRow>());
 
@@ -98,6 +110,10 @@ namespace AreaManager.Services
                 TableStyle = ObjectId.Null,
                 Position = insertionPoint
             };
+
+            // Same rationale as above: suppress title/header before sizing/filling.
+            table.IsTitleSuppressed = true;
+            table.IsHeaderSuppressed = true;
 
             var rowList = new List<WorkspaceAreaRow>(rows ?? Array.Empty<WorkspaceAreaRow>());
 

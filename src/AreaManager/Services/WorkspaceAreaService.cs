@@ -4,8 +4,9 @@ using System.Linq;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
 using Autodesk.Gis.Map;
-using Autodesk.Gis.Map.ObjectData;
 using AreaManager.Models;
+
+// Alias the AutoCAD table class to avoid ambiguity with Autodesk.Gis.Map.ObjectData.Table.
 using AcadTable = Autodesk.AutoCAD.DatabaseServices.Table;
 using MapOpenMode = Autodesk.Gis.Map.Constants.OpenMode;
 using ObjectDataTable = Autodesk.Gis.Map.ObjectData.Table;
@@ -13,10 +14,19 @@ using ObjectDataTable = Autodesk.Gis.Map.ObjectData.Table;
 namespace AreaManager.Services
 {
     /// <summary>
-    /// Service responsible for reading workspace rows from a source table and computing
-    /// aggregate area values for the crown area usage report.  This implementation has
-    /// been updated to better handle tables without explicit header rows and to
-    /// interpret "Yes"/"No" values in the "within existing dispositions" column.
+    /// Reads workspace rows from a source AutoCAD table and computes aggregate area values
+    /// for the crown area usage report.
+    ///
+    /// Notes:
+    /// - The source table is expected to be the "Temporary Areas" table produced by this tool.
+    /// - The "Within Existing Dispositions" column can contain:
+    ///     * "No"  (treat within-dispo as 0)
+    ///     * "Yes" (treat within-dispo as TOTAL area)
+    ///     * a numeric value (treat within-dispo as that number)
+    /// - The "Existing Cut Disturbance" column is interpreted as TOTAL existing disturbance
+    ///   (existing cut + existing disposition). We derive cut-only by subtracting within-dispo.
+    ///
+    /// This file is written to compile and run on AutoCAD 2015 and 2025.
     /// </summary>
     public static class WorkspaceAreaService
     {
@@ -36,6 +46,7 @@ namespace AreaManager.Services
                 }
 
                 WarnOnDuplicateWorkspaceShapes(editor, transaction, database);
+
                 var entries = ReadWorkspaceEntriesFromTable(editor, table);
                 results.AddRange(entries.Select(BuildWorkspaceAreaRow));
 
@@ -49,9 +60,15 @@ namespace AreaManager.Services
                 .ToList();
         }
 
+        /// <summary>
+        /// Warn if the drawing contains multiple OD-boundary shapes with the same WORKSPACENUM value.
+        /// This does not stop processing, but it is a strong indicator that area calculations may be wrong.
+        ///
+        /// IMPORTANT: Map ObjectData objects must be disposed. Failing to dispose these over repeated
+        /// runs is a common cause of instability / access violations.
+        /// </summary>
         private static void WarnOnDuplicateWorkspaceShapes(Editor editor, Transaction transaction, Database database)
         {
-            var seen = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             var mapApp = HostMapApplicationServices.Application;
             var tables = mapApp.ActiveProject.ODTables;
 
@@ -60,57 +77,78 @@ namespace AreaManager.Services
                 return;
             }
 
-            ObjectDataTable odTable = tables[WorkspaceTableName];
-
-            var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
-            var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForRead);
-
-            foreach (ObjectId objectId in modelSpace)
+            using (ObjectDataTable odTable = tables[WorkspaceTableName])
             {
-                var entity = transaction.GetObject(objectId, OpenMode.ForRead) as Entity;
-                if (entity == null)
-                {
-                    continue;
-                }
-
-                var records = odTable.GetObjectTableRecords(0, entity, MapOpenMode.OpenForRead, false);
-                if (records.Count == 0)
-                {
-                    continue;
-                }
-
-                var record = records[0];
                 var fieldIndex = FindFieldIndex(odTable.FieldDefinitions, WorkspaceFieldName);
                 if (fieldIndex < 0)
                 {
-                    continue;
+                    return;
                 }
 
-                var value = record[fieldIndex].StrValue;
-                if (string.IsNullOrWhiteSpace(value))
+                var seen = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                var blockTable = (BlockTable)transaction.GetObject(database.BlockTableId, OpenMode.ForRead);
+                var modelSpace = (BlockTableRecord)transaction.GetObject(blockTable[BlockTableRecord.ModelSpace], OpenMode.ForRead);
+
+                foreach (ObjectId objectId in modelSpace)
                 {
-                    continue;
+                    var entity = transaction.GetObject(objectId, OpenMode.ForRead) as Entity;
+                    if (entity == null)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        using (var records = odTable.GetObjectTableRecords(0, entity, MapOpenMode.OpenForRead, false))
+                        {
+                            if (records == null || records.Count == 0)
+                            {
+                                continue;
+                            }
+
+                            var record = records[0];
+                            using (var mapValue = record[fieldIndex])
+                            {
+                                var value = mapValue.StrValue;
+                                if (string.IsNullOrWhiteSpace(value))
+                                {
+                                    continue;
+                                }
+
+                                var key = value.Trim();
+                                if (seen.ContainsKey(key))
+                                {
+                                    seen[key] += 1;
+                                }
+                                else
+                                {
+                                    seen[key] = 1;
+                                }
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // MapException / interop failures can occur on proxy entities etc.
+                        // Ignore and keep scanning.
+                    }
                 }
 
-                var key = value.Trim();
-                if (seen.ContainsKey(key))
-                {
-                    seen[key] += 1;
-                }
-                else
-                {
-                    seen[key] = 1;
-                }
-            }
+                var duplicates = seen
+                    .Where(item => item.Value > 1)
+                    .Select(item => item.Key)
+                    .ToList();
 
-            var duplicates = seen.Where(item => item.Value > 1).Select(item => item.Key).ToList();
-            if (duplicates.Count > 0)
-            {
-                editor.WriteMessage($"\nWarning: Duplicate WORKSPACENUM values found in object data: {string.Join(", ", duplicates)}.");
+                if (duplicates.Count > 0)
+                {
+                    editor.WriteMessage(
+                        $"\nWarning: Duplicate WORKSPACENUM values found in object data: {string.Join(", ", duplicates)}.");
+                }
             }
         }
 
-        private static int FindFieldIndex(FieldDefinitions fieldDefinitions, string fieldName)
+        private static int FindFieldIndex(Autodesk.Gis.Map.ObjectData.FieldDefinitions fieldDefinitions, string fieldName)
         {
             for (var index = 0; index < fieldDefinitions.Count; index++)
             {
@@ -125,21 +163,16 @@ namespace AreaManager.Services
         }
 
         /// <summary>
-        /// Reads each row from the selected workspace source table and produces a list of
-        /// WorkspaceTableEntry objects.  The logic here interprets the "within existing dispositions"
-        /// column: when the cell contains "Yes" (case insensitive) and no numeric disposition value
-        /// is present, the row's entire area is considered part of the existing disposition; when the
-        /// cell contains "No" and no numeric cut value is present, the area is treated as existing
-        /// cut.  Numeric values in either column override this behaviour.
+        /// Reads each row from the selected workspace source table and produces a list of entries.
+        /// Duplicate workspace IDs are resolved by choosing the entry with the larger total area.
         /// </summary>
         private static List<WorkspaceTableEntry> ReadWorkspaceEntriesFromTable(Editor editor, AcadTable table)
         {
-            var entries = new List<WorkspaceTableEntry>();
             var headerRow = FindHeaderRow(table);
             var columnMap = MapWorkspaceColumns(table, headerRow);
             var startRow = headerRow >= 0 ? headerRow + 1 : 0;
 
-            var duplicates = new Dictionary<string, WorkspaceTableEntry>(StringComparer.OrdinalIgnoreCase);
+            var unique = new Dictionary<string, WorkspaceTableEntry>(StringComparer.OrdinalIgnoreCase);
 
             for (var rowIndex = startRow; rowIndex < table.Rows.Count; rowIndex++)
             {
@@ -155,49 +188,20 @@ namespace AreaManager.Services
                     Width = ReadCellNumber(table, rowIndex, columnMap.WidthColumn),
                     Length = ReadCellNumber(table, rowIndex, columnMap.LengthColumn),
                     AreaHa = ReadCellNumber(table, rowIndex, columnMap.AreaColumn),
-                    ExistingDispositionHa = ReadCellNumber(table, rowIndex, columnMap.ExistingDispositionColumn),
-                    ExistingCutHa = ReadCellNumber(table, rowIndex, columnMap.ExistingCutColumn),
                     TotalHa = ReadCellNumber(table, rowIndex, columnMap.TotalColumn),
-                    NewCutHa = ReadCellNumber(table, rowIndex, columnMap.NewCutColumn)
+
+                    ExistingDispositionHa = ReadCellNumber(table, rowIndex, columnMap.ExistingDispositionColumn),
+                    ExistingDispositionText = ReadCellText(table, rowIndex, columnMap.ExistingDispositionColumn),
+
+                    ExistingCutDisturbanceHa = ReadCellNumber(table, rowIndex, columnMap.ExistingCutDisturbanceColumn),
+                    NewCutDisturbanceHa = ReadCellNumber(table, rowIndex, columnMap.NewCutDisturbanceColumn)
                 };
 
-                // Calculate the total area using width/length or area fields as appropriate
                 entry.TotalHa = ResolveTotalArea(entry);
 
-                // Interpret the 'within existing dispositions' column.  If the cell contains
-                // 'Yes' or 'No' (case insensitive) and the existing disposition field isn't numeric,
-                // use the entire area as the disposition or cut accordingly.
-                if (columnMap.ExistingDispositionColumn >= 0)
+                if (!unique.TryGetValue(entry.WorkspaceId, out var existing))
                 {
-                    if (!entry.ExistingDispositionHa.HasValue)
-                    {
-                        var dispText = ReadCellText(table, rowIndex, columnMap.ExistingDispositionColumn);
-                        if (!string.IsNullOrWhiteSpace(dispText))
-                        {
-                            var normalized = dispText.Trim().ToUpperInvariant();
-                            if (normalized == "YES")
-                            {
-                                if (entry.TotalHa.HasValue)
-                                {
-                                    entry.ExistingDispositionHa = entry.TotalHa;
-                                    entry.ExistingCutHa = 0.0;
-                                }
-                            }
-                            else if (normalized == "NO")
-                            {
-                                if (!entry.ExistingCutHa.HasValue && entry.TotalHa.HasValue)
-                                {
-                                    entry.ExistingCutHa = entry.TotalHa;
-                                    entry.ExistingDispositionHa = 0.0;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (!duplicates.TryGetValue(entry.WorkspaceId, out var existing))
-                {
-                    duplicates[entry.WorkspaceId] = entry;
+                    unique[entry.WorkspaceId] = entry;
                     continue;
                 }
 
@@ -207,36 +211,40 @@ namespace AreaManager.Services
                 }
 
                 var resolved = ResolveDuplicateEntry(existing, entry);
-                duplicates[entry.WorkspaceId] = resolved;
+                unique[entry.WorkspaceId] = resolved;
 
-                editor.WriteMessage($"\nWarning: Duplicate workspace '{entry.WorkspaceId}' with different sizes/areas detected. Using the larger area.");
+                editor.WriteMessage(
+                    $"\nWarning: Duplicate workspace '{entry.WorkspaceId}' with different sizes/areas detected. Using the larger area.");
             }
 
-            entries.AddRange(duplicates.Values);
-            return entries;
+            return unique.Values.ToList();
         }
 
         /// <summary>
-        /// Maps column indices to their respective roles.  When a header row isn't found,
-        /// this method assumes a fixed column layout corresponding to the default
-        /// temporary areas table: description, workspace ID, width, length, area,
-        /// within dispositions, existing cut disturbance, new cut disturbance.
+        /// Map column indices to their roles.
+        /// If no header row exists, assume the default Temporary Areas table layout:
+        ///   0 Description
+        ///   1 Identifier
+        ///   2 Width
+        ///   3 Length
+        ///   4 Area (ha)
+        ///   5 Within Existing Dispositions (Yes/No/number)
+        ///   6 Existing Cut Disturbance (ha)
+        ///   7 New Cut Disturbance (ha)
         /// </summary>
         private static WorkspaceColumnMap MapWorkspaceColumns(AcadTable table, int headerRow)
         {
             var map = new WorkspaceColumnMap();
+
             if (headerRow < 0)
             {
-                // Default mapping for a table without a header.  Column 1 holds the workspace ID (identifier),
-                // columns 2 and 3 hold width and length, column 4 is area, column 5 is the within dispositions
-                // flag (Yes/No), column 6 is the existing cut area, and column 7 (if present) is new cut (ignored).
                 map.WorkspaceIdColumn = 1;
                 map.WidthColumn = 2;
                 map.LengthColumn = 3;
                 map.AreaColumn = 4;
                 map.ExistingDispositionColumn = 5;
-                map.ExistingCutColumn = 6;
-                map.NewCutColumn = 7;
+                map.ExistingCutDisturbanceColumn = 6;
+                map.NewCutDisturbanceColumn = 7;
                 map.TotalColumn = -1;
                 return map;
             }
@@ -250,7 +258,9 @@ namespace AreaManager.Services
                 }
 
                 var normalized = header.Trim().ToUpperInvariant();
-                if (map.WorkspaceIdColumn < 0 && (normalized.Contains("WORKSPACE") || normalized.Contains("W#") || normalized == "ID" || normalized.Contains("DESCRIPTION")))
+
+                if (map.WorkspaceIdColumn < 0 &&
+                    (normalized.Contains("WORKSPACE") || normalized.Contains("W#") || normalized == "ID" || normalized.Contains("DESCRIPTION")))
                 {
                     map.WorkspaceIdColumn = colIndex;
                     continue;
@@ -268,21 +278,21 @@ namespace AreaManager.Services
                     continue;
                 }
 
-                if (map.ExistingDispositionColumn < 0 && normalized.Contains("DISPOSITION"))
+                if (map.ExistingDispositionColumn < 0 && (normalized.Contains("DISPOSITION") || normalized.Contains("WITHIN")))
                 {
                     map.ExistingDispositionColumn = colIndex;
                     continue;
                 }
 
-                if (map.ExistingCutColumn < 0 && normalized.Contains("EXISTING CUT"))
+                if (map.ExistingCutDisturbanceColumn < 0 && (normalized.Contains("EXISTING CUT") || normalized.Contains("CUT DIST")))
                 {
-                    map.ExistingCutColumn = colIndex;
+                    map.ExistingCutDisturbanceColumn = colIndex;
                     continue;
                 }
 
-                if (map.NewCutColumn < 0 && normalized.Contains("NEW CUT"))
+                if (map.NewCutDisturbanceColumn < 0 && normalized.Contains("NEW CUT"))
                 {
-                    map.NewCutColumn = colIndex;
+                    map.NewCutDisturbanceColumn = colIndex;
                     continue;
                 }
 
@@ -298,9 +308,9 @@ namespace AreaManager.Services
                 }
             }
 
+            // Reasonable defaults if header mapping fails.
             if (map.WorkspaceIdColumn < 0)
             {
-                // default to identifier column if not mapped
                 map.WorkspaceIdColumn = 1;
             }
 
@@ -351,56 +361,69 @@ namespace AreaManager.Services
                 return (entry.Width.Value * entry.Length.Value) / 10000.0;
             }
 
-            // Derive the total from existing components if present.  When any of the
-            // disturbance values are provided, sum them all to obtain the total.  This
-            // accommodates tables that explicitly include a new cut column.
-            if (entry.ExistingCutHa.HasValue || entry.ExistingDispositionHa.HasValue || entry.NewCutHa.HasValue)
+            // If the table only provides disturbance values, derive total from them.
+            if (entry.ExistingCutDisturbanceHa.HasValue || entry.NewCutDisturbanceHa.HasValue)
             {
-                return (entry.ExistingCutHa ?? 0.0) + (entry.ExistingDispositionHa ?? 0.0) + (entry.NewCutHa ?? 0.0);
+                return (entry.ExistingCutDisturbanceHa ?? 0.0) + (entry.NewCutDisturbanceHa ?? 0.0);
             }
 
             return null;
         }
 
-        /// <summary>
-        /// Constructs a WorkspaceAreaRow from a raw table entry by populating totals and disturbances.
-        /// Existing disposition and cut values are passed through directly, and the total is computed
-        /// if not explicitly provided.  New cut disturbance is always zero in this context.
-        /// </summary>
         private static WorkspaceAreaRow BuildWorkspaceAreaRow(WorkspaceTableEntry entry)
         {
-            var existingCut = entry.ExistingCutHa ?? 0.0;
+            var total = entry.TotalHa ?? 0.0;
+
+            // Within (Existing Disposition): numeric overrides; otherwise interpret Yes/No.
             var existingDisposition = entry.ExistingDispositionHa ?? 0.0;
-            // Determine the total area for this workspace.  Prefer the explicit
-            // TotalHa value if provided; otherwise compute it as the sum of existing
-            // cut, existing disposition and new cut (when supplied) or fall back to
-            // the sum of the known components.
-            var total = entry.TotalHa ?? (existingCut + existingDisposition + (entry.NewCutHa ?? 0.0));
-            // Compute the new cut disturbance.  If a new cut value was read from the
-            // table, use it directly.  Otherwise derive it from the total minus
-            // existing cut and disposition.  Clamp negative values to zero to guard
-            // against inconsistent data.
-            var newCut = entry.NewCutHa ?? (total - existingCut - existingDisposition);
-            if (newCut < 0) newCut = 0.0;
+            if (!entry.ExistingDispositionHa.HasValue)
+            {
+                var dispText = (entry.ExistingDispositionText ?? string.Empty).Trim();
+                if (dispText.Equals("YES", StringComparison.OrdinalIgnoreCase))
+                {
+                    existingDisposition = total;
+                }
+                else
+                {
+                    // "NO", blank, or anything else
+                    existingDisposition = 0.0;
+                }
+            }
+
+            // Existing Cut Disturbance: already includes disposition.
+            var existingCutDisturbance = entry.ExistingCutDisturbanceHa;
+            if (!existingCutDisturbance.HasValue)
+            {
+                // If missing, try to derive from total and new-cut.
+                if (entry.NewCutDisturbanceHa.HasValue)
+                {
+                    existingCutDisturbance = Math.Max(0.0, total - entry.NewCutDisturbanceHa.Value);
+                }
+                else
+                {
+                    existingCutDisturbance = 0.0;
+                }
+            }
+
+            var newCutDisturbance = entry.NewCutDisturbanceHa;
+            if (!newCutDisturbance.HasValue)
+            {
+                newCutDisturbance = Math.Max(0.0, total - existingCutDisturbance.Value);
+            }
+
+            var existingCutOnly = Math.Max(0.0, existingCutDisturbance.Value - existingDisposition);
 
             return new WorkspaceAreaRow
             {
                 WorkspaceId = entry.WorkspaceId,
-                ExistingCutHa = existingCut,
+                ExistingCutHa = existingCutOnly,
                 ExistingDispositionHa = existingDisposition,
                 TotalHa = total,
-                // Existing cut disturbance includes both existing cut and existing
-                // disposition areas.
-                ExistingCutDisturbanceHa = existingCut + existingDisposition,
-                NewCutDisturbanceHa = newCut
+                ExistingCutDisturbanceHa = existingCutDisturbance.Value,
+                NewCutDisturbanceHa = newCutDisturbance.Value
             };
         }
 
-        /// <summary>
-        /// Attempts to locate a header row by scanning the first two rows of the table for cells
-        /// containing typical header text (e.g., "WORKSPACE" or "DESCRIPTION").  Returns the index
-        /// of the header row or -1 if none is found.
-        /// </summary>
         private static int FindHeaderRow(AcadTable table)
         {
             var maxScan = Math.Min(table.Rows.Count, 2);
@@ -415,18 +438,17 @@ namespace AreaManager.Services
                     }
                 }
             }
+
             return -1;
         }
 
-        /// <summary>
-        /// Determines whether a given cell value likely belongs to a header row based on keywords.
-        /// </summary>
         private static bool IsHeaderText(string text)
         {
             if (string.IsNullOrWhiteSpace(text))
             {
                 return false;
             }
+
             var upper = text.Trim().ToUpperInvariant();
             return upper.Contains("DESCRIPTION") || upper.Contains("WORKSPACE") || upper.Contains("W#") || upper.Contains("ID");
         }
@@ -435,10 +457,12 @@ namespace AreaManager.Services
         {
             return ValuesMatch(first.Width, second.Width)
                 && ValuesMatch(first.Length, second.Length)
-                && ValuesMatch(first.AreaHa, second.AreaHa)
                 && ValuesMatch(first.TotalHa, second.TotalHa)
+                && ValuesMatch(first.AreaHa, second.AreaHa)
                 && ValuesMatch(first.ExistingDispositionHa, second.ExistingDispositionHa)
-                && ValuesMatch(first.ExistingCutHa, second.ExistingCutHa);
+                && string.Equals((first.ExistingDispositionText ?? string.Empty).Trim(), (second.ExistingDispositionText ?? string.Empty).Trim(), StringComparison.OrdinalIgnoreCase)
+                && ValuesMatch(first.ExistingCutDisturbanceHa, second.ExistingCutDisturbanceHa)
+                && ValuesMatch(first.NewCutDisturbanceHa, second.NewCutDisturbanceHa);
         }
 
         private static bool ValuesMatch(double? first, double? second)
@@ -531,29 +555,26 @@ namespace AreaManager.Services
             public int LengthColumn { get; set; } = -1;
             public int AreaColumn { get; set; } = -1;
             public int ExistingDispositionColumn { get; set; } = -1;
-            public int ExistingCutColumn { get; set; } = -1;
+            public int ExistingCutDisturbanceColumn { get; set; } = -1;
+            public int NewCutDisturbanceColumn { get; set; } = -1;
             public int TotalColumn { get; set; } = -1;
-            // Index of the New Cut Disturbance column. When the source table
-            // lacks explicit headers (the default temporary areas table layout),
-            // this is mapped to column 7 so that new cut values propagate into
-            // the crown area usage summary.  For headered tables, this value
-            // remains -1 unless a header containing "NEW CUT" is detected.
-            public int NewCutColumn { get; set; } = -1;
         }
 
         private class WorkspaceTableEntry
         {
             public string WorkspaceId { get; set; }
+
             public double? Width { get; set; }
             public double? Length { get; set; }
+
             public double? AreaHa { get; set; }
-            public double? ExistingDispositionHa { get; set; }
-            public double? ExistingCutHa { get; set; }
             public double? TotalHa { get; set; }
-            // New cut disturbance (ha) for this workspace.  This value is read from
-            // the source table if present.  When absent, it will be computed as
-            // TotalHa - (ExistingCutHa + ExistingDispositionHa) in BuildWorkspaceAreaRow.
-            public double? NewCutHa { get; set; }
+
+            public double? ExistingDispositionHa { get; set; }
+            public string ExistingDispositionText { get; set; }
+
+            public double? ExistingCutDisturbanceHa { get; set; }
+            public double? NewCutDisturbanceHa { get; set; }
         }
     }
 }
