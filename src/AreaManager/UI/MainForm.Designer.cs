@@ -64,6 +64,7 @@ namespace AreaManager.UI
             this.addRtfInfoButton.Size = new System.Drawing.Size(234, 35);
             this.addRtfInfoButton.TabIndex = 3;
             this.addRtfInfoButton.Text = "Add RTF Info";
+            this.addRtfInfoButton.Font = new System.Drawing.Font("Segoe UI", 9F, System.Drawing.FontStyle.Bold);
             this.addRtfInfoButton.UseVisualStyleBackColor = true;
             this.addRtfInfoButton.Click += new System.EventHandler(this.addRtfInfoButton_Click);
             // 
