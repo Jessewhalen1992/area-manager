@@ -28,6 +28,149 @@ namespace AreaManager.Services
         private const string WorkspaceTableName = "WORKSPACENUM";
         private const string WorkspaceFieldName = "WORKSPACENUM";
 
+        public static void AddRtfInfoToTemporaryAreasTable()
+        {
+            var document = Application.DocumentManager.MdiActiveDocument;
+            var editor = document.Editor;
+            var database = document.Database;
+
+            var tableSelection = PromptForTempAreasTable(editor);
+            if (tableSelection == ObjectId.Null)
+            {
+                return;
+            }
+
+            var activityResult = editor.GetString(new PromptStringOptions("\nActivity type (e.g. WORKSPACE, LOG DECK): ")
+            {
+                AllowSpaces = true
+            });
+            if (activityResult.Status != PromptStatus.OK)
+            {
+                return;
+            }
+
+            var activityType = (activityResult.StringResult ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(activityType))
+            {
+                editor.WriteMessage("\nNo activity type provided.");
+                return;
+            }
+
+            var colorsResult = editor.GetString(new PromptStringOptions("\nACI color numbers to accumulate (comma-separated): ")
+            {
+                AllowSpaces = true
+            });
+            if (colorsResult.Status != PromptStatus.OK)
+            {
+                return;
+            }
+
+            var colorIndexes = ParseColorIndexes(colorsResult.StringResult);
+            if (colorIndexes.Count == 0)
+            {
+                editor.WriteMessage("\nNo valid ACI color numbers provided.");
+                return;
+            }
+
+            var doc = Autodesk.AutoCAD.ApplicationServices.Application.DocumentManager.GetDocument(database);
+            using (var docLock = doc?.LockDocument())
+            using (var transaction = database.TransactionManager.StartTransaction())
+            {
+                var table = transaction.GetObject(tableSelection, OpenMode.ForWrite) as AcadTable;
+                if (table == null)
+                {
+                    return;
+                }
+
+                var headerRow = FindHeaderRow(table);
+                var columnMap = MapTempAreaColumns(table, headerRow);
+                var startRow = headerRow >= 0 ? headerRow + 1 : 0;
+
+                int lastMatchingRow = -1;
+                double totalArea = 0.0;
+                double totalExistingCut = 0.0;
+                double totalNewCut = 0.0;
+
+                for (var rowIndex = startRow; rowIndex < table.Rows.Count; rowIndex++)
+                {
+                    var description = ReadCellText(table, rowIndex, columnMap.DescriptionColumn).Trim();
+                    if (!description.Equals(activityType, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    lastMatchingRow = rowIndex;
+
+                    if (CellHasMatchingColor(table, rowIndex, columnMap.AreaColumn, colorIndexes))
+                    {
+                        totalArea += ReadCellNumber(table, rowIndex, columnMap.AreaColumn);
+                    }
+
+                    if (CellHasMatchingColor(table, rowIndex, columnMap.ExistingCutDisturbanceColumn, colorIndexes))
+                    {
+                        totalExistingCut += ReadCellNumber(table, rowIndex, columnMap.ExistingCutDisturbanceColumn);
+                    }
+
+                    if (CellHasMatchingColor(table, rowIndex, columnMap.NewCutDisturbanceColumn, colorIndexes))
+                    {
+                        totalNewCut += ReadCellNumber(table, rowIndex, columnMap.NewCutDisturbanceColumn);
+                    }
+                }
+
+                if (lastMatchingRow < 0)
+                {
+                    editor.WriteMessage($"\nNo rows found for activity type '{activityType}'.");
+                    return;
+                }
+
+                var insertIndex = lastMatchingRow + 1;
+                var rowHeight = table.Rows[lastMatchingRow].Height;
+                table.InsertRows(insertIndex, rowHeight, 1);
+
+                var label = $"TOTAL INCIDENTAL {activityType.ToUpperInvariant()} RTF";
+                var mergeEndColumn = Math.Min(4, table.Columns.Count - 1);
+
+                table.Cells[insertIndex, 0].TextString = label;
+                if (mergeEndColumn > 0)
+                {
+                    table.MergeCells(CellRange.Create(table, insertIndex, 0, insertIndex, mergeEndColumn));
+                }
+
+                var totalsColumns = ResolveTotalsColumns(table.Columns.Count);
+                if (totalsColumns.TotalAreaColumn >= 0)
+                {
+                    table.Cells[insertIndex, totalsColumns.TotalAreaColumn].TextString =
+                        totalArea.ToString("0.000", CultureInfo.InvariantCulture);
+                }
+
+                if (totalsColumns.DashColumn >= 0)
+                {
+                    table.Cells[insertIndex, totalsColumns.DashColumn].TextString = "-";
+                }
+
+                if (totalsColumns.ExistingCutColumn >= 0)
+                {
+                    table.Cells[insertIndex, totalsColumns.ExistingCutColumn].TextString =
+                        totalExistingCut.ToString("0.000", CultureInfo.InvariantCulture);
+                }
+
+                if (totalsColumns.NewCutColumn >= 0)
+                {
+                    table.Cells[insertIndex, totalsColumns.NewCutColumn].TextString =
+                        totalNewCut.ToString("0.000", CultureInfo.InvariantCulture);
+                }
+
+                for (int col = 0; col < table.Columns.Count; col++)
+                {
+                    var cell = table.Cells[insertIndex, col];
+                    cell.Alignment = CellAlignment.MiddleCenter;
+                    cell.TextHeight = 10.0;
+                }
+
+                transaction.Commit();
+            }
+        }
+
         public static void GenerateTemporaryAreasTable()
         {
             var document = Application.DocumentManager.MdiActiveDocument;
@@ -408,6 +551,19 @@ namespace AreaManager.Services
             return result.Status == PromptStatus.OK ? result.ObjectId : ObjectId.Null;
         }
 
+        private static ObjectId PromptForTempAreasTable(Editor editor)
+        {
+            var options = new PromptEntityOptions("\nSelect temporary areas table: ")
+            {
+                AllowNone = false
+            };
+            options.SetRejectMessage("\nOnly tables are allowed.");
+            options.AddAllowedClass(typeof(AcadTable), true);
+
+            var result = editor.GetEntity(options);
+            return result.Status == PromptStatus.OK ? result.ObjectId : ObjectId.Null;
+        }
+
         private static void ApplyTableStyle(Transaction transaction, Database database, Editor editor, AcadTable table, string styleName)
         {
             // Always end up with a valid style. If the named style isn't present,
@@ -475,6 +631,218 @@ namespace AreaManager.Services
             }
 
             return int.MaxValue;
+        }
+
+        private static HashSet<short> ParseColorIndexes(string input)
+        {
+            var results = new HashSet<short>();
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                return results;
+            }
+
+            var parts = input.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (var part in parts)
+            {
+                if (!short.TryParse(part.Trim(), out var index))
+                {
+                    continue;
+                }
+
+                if (index < 0)
+                {
+                    continue;
+                }
+
+                results.Add(index);
+            }
+
+            return results;
+        }
+
+        private static bool CellHasMatchingColor(AcadTable table, int rowIndex, int columnIndex, HashSet<short> colorIndexes)
+        {
+            if (rowIndex < 0 || rowIndex >= table.Rows.Count || columnIndex < 0 || columnIndex >= table.Columns.Count)
+            {
+                return false;
+            }
+
+            var color = table.Cells[rowIndex, columnIndex].BackgroundColor;
+            if (color == null || color.ColorMethod != Autodesk.AutoCAD.Colors.ColorMethod.ByAci)
+            {
+                return false;
+            }
+
+            return colorIndexes.Contains((short)color.ColorIndex);
+        }
+
+        private static string ReadCellText(AcadTable table, int rowIndex, int columnIndex)
+        {
+            if (rowIndex < 0 || rowIndex >= table.Rows.Count || columnIndex < 0 || columnIndex >= table.Columns.Count)
+            {
+                return string.Empty;
+            }
+
+            return table.Cells[rowIndex, columnIndex].TextString ?? string.Empty;
+        }
+
+        private static double ReadCellNumber(AcadTable table, int rowIndex, int columnIndex)
+        {
+            var text = ReadCellText(table, rowIndex, columnIndex);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return 0.0;
+            }
+
+            var numberText = TextParsingService.ExtractLastNumber(text);
+            if (string.IsNullOrWhiteSpace(numberText))
+            {
+                return 0.0;
+            }
+
+            return TextParsingService.ParseDoubleOrDefault(numberText);
+        }
+
+        private static int FindHeaderRow(AcadTable table)
+        {
+            var maxScan = Math.Min(table.Rows.Count, 2);
+            for (var rowIndex = 0; rowIndex < maxScan; rowIndex++)
+            {
+                for (var colIndex = 0; colIndex < table.Columns.Count; colIndex++)
+                {
+                    var text = ReadCellText(table, rowIndex, colIndex);
+                    if (IsHeaderText(text))
+                    {
+                        return rowIndex;
+                    }
+                }
+            }
+
+            return -1;
+        }
+
+        private static bool IsHeaderText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            var upper = text.Trim().ToUpperInvariant();
+            return upper.Contains("DESCRIPTION") || upper.Contains("WORKSPACE") || upper.Contains("ACTIVITY") || upper.Contains("ID");
+        }
+
+        private static TempAreaColumnMap MapTempAreaColumns(AcadTable table, int headerRow)
+        {
+            var map = new TempAreaColumnMap();
+
+            if (headerRow < 0)
+            {
+                map.DescriptionColumn = 0;
+                map.AreaColumn = 4;
+                map.ExistingDispositionColumn = 5;
+                map.ExistingCutDisturbanceColumn = 6;
+                map.NewCutDisturbanceColumn = 7;
+                return map;
+            }
+
+            for (var colIndex = 0; colIndex < table.Columns.Count; colIndex++)
+            {
+                var header = ReadCellText(table, headerRow, colIndex);
+                if (string.IsNullOrWhiteSpace(header))
+                {
+                    continue;
+                }
+
+                var normalized = header.Trim().ToUpperInvariant();
+
+                if (map.DescriptionColumn < 0 &&
+                    (normalized.Contains("DESCRIPTION") || normalized.Contains("ACTIVITY") || normalized.Contains("WORKSPACE")))
+                {
+                    map.DescriptionColumn = colIndex;
+                    continue;
+                }
+
+                if (map.AreaColumn < 0 && normalized.Contains("AREA"))
+                {
+                    map.AreaColumn = colIndex;
+                    continue;
+                }
+
+                if (map.ExistingDispositionColumn < 0 && (normalized.Contains("DISPOSITION") || normalized.Contains("WITHIN")))
+                {
+                    map.ExistingDispositionColumn = colIndex;
+                    continue;
+                }
+
+                if (map.ExistingCutDisturbanceColumn < 0 && (normalized.Contains("EXISTING CUT") || normalized.Contains("CUT DIST")))
+                {
+                    map.ExistingCutDisturbanceColumn = colIndex;
+                    continue;
+                }
+
+                if (map.NewCutDisturbanceColumn < 0 && normalized.Contains("NEW CUT"))
+                {
+                    map.NewCutDisturbanceColumn = colIndex;
+                }
+            }
+
+            if (map.DescriptionColumn < 0)
+            {
+                map.DescriptionColumn = 0;
+            }
+
+            return map;
+        }
+
+        private static TotalsColumnMap ResolveTotalsColumns(int columnCount)
+        {
+            if (columnCount >= 9)
+            {
+                return new TotalsColumnMap
+                {
+                    TotalAreaColumn = 5,
+                    DashColumn = 6,
+                    ExistingCutColumn = 7,
+                    NewCutColumn = 8
+                };
+            }
+
+            if (columnCount >= 8)
+            {
+                return new TotalsColumnMap
+                {
+                    TotalAreaColumn = 5,
+                    DashColumn = -1,
+                    ExistingCutColumn = 6,
+                    NewCutColumn = 7
+                };
+            }
+
+            return new TotalsColumnMap
+            {
+                TotalAreaColumn = -1,
+                DashColumn = -1,
+                ExistingCutColumn = -1,
+                NewCutColumn = -1
+            };
+        }
+
+        private class TempAreaColumnMap
+        {
+            public int DescriptionColumn { get; set; } = -1;
+            public int AreaColumn { get; set; } = 4;
+            public int ExistingDispositionColumn { get; set; } = 5;
+            public int ExistingCutDisturbanceColumn { get; set; } = 6;
+            public int NewCutDisturbanceColumn { get; set; } = 7;
+        }
+
+        private class TotalsColumnMap
+        {
+            public int TotalAreaColumn { get; set; }
+            public int DashColumn { get; set; }
+            public int ExistingCutColumn { get; set; }
+            public int NewCutColumn { get; set; }
         }
 
         private static bool ComputeAreasForRows(Editor editor, Database database, List<TempAreaRow> rows)
