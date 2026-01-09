@@ -88,6 +88,7 @@ namespace AreaManager.Services
 
                 int lastMatchingRow = -1;
                 double totalArea = 0.0;
+                double totalWithinDisposition = 0.0;
                 double totalExistingCut = 0.0;
                 double totalNewCut = 0.0;
 
@@ -103,7 +104,19 @@ namespace AreaManager.Services
 
                     if (CellHasMatchingColor(table, rowIndex, columnMap.AreaColumn, colorIndexes))
                     {
-                        totalArea += ReadCellNumber(table, rowIndex, columnMap.AreaColumn);
+                        var areaValue = ReadCellNumber(table, rowIndex, columnMap.AreaColumn);
+                        totalArea += areaValue;
+
+                        var withinText = ReadCellText(table, rowIndex, columnMap.ExistingDispositionColumn).Trim();
+                        if (withinText.Equals("YES", StringComparison.OrdinalIgnoreCase))
+                        {
+                            totalWithinDisposition += areaValue;
+                        }
+                        else if (!withinText.Equals("NO", StringComparison.OrdinalIgnoreCase) &&
+                                 !string.IsNullOrWhiteSpace(withinText))
+                        {
+                            totalWithinDisposition += ReadCellNumber(table, rowIndex, columnMap.ExistingDispositionColumn);
+                        }
                     }
 
                     if (CellHasMatchingColor(table, rowIndex, columnMap.ExistingCutDisturbanceColumn, colorIndexes))
@@ -127,8 +140,8 @@ namespace AreaManager.Services
                 var rowHeight = table.Rows[lastMatchingRow].Height;
                 table.InsertRows(insertIndex, rowHeight, 1);
 
-                var label = $"TOTAL INCIDENTAL {activityType.ToUpperInvariant()} RTF";
-                var mergeEndColumn = Math.Min(4, table.Columns.Count - 1);
+                var label = "TOTAL INCIDENTAL WORKSPACE RTF";
+                var mergeEndColumn = Math.Min(3, table.Columns.Count - 1);
 
                 table.Cells[insertIndex, 0].TextString = label;
                 if (mergeEndColumn > 0)
@@ -141,6 +154,12 @@ namespace AreaManager.Services
                 {
                     table.Cells[insertIndex, totalsColumns.TotalAreaColumn].TextString =
                         totalArea.ToString("0.000", CultureInfo.InvariantCulture);
+                }
+
+                if (totalsColumns.WithinDispositionColumn >= 0)
+                {
+                    table.Cells[insertIndex, totalsColumns.WithinDispositionColumn].TextString =
+                        totalWithinDisposition.ToString("0.000", CultureInfo.InvariantCulture);
                 }
 
                 if (totalsColumns.DashColumn >= 0)
@@ -160,11 +179,21 @@ namespace AreaManager.Services
                         totalNewCut.ToString("0.000", CultureInfo.InvariantCulture);
                 }
 
+                var summaryColor = colorIndexes.Count > 0
+                    ? Autodesk.AutoCAD.Colors.Color.FromColorIndex(
+                        Autodesk.AutoCAD.Colors.ColorMethod.ByAci,
+                        colorIndexes.Min())
+                    : null;
+
                 for (int col = 0; col < table.Columns.Count; col++)
                 {
                     var cell = table.Cells[insertIndex, col];
                     cell.Alignment = CellAlignment.MiddleCenter;
                     cell.TextHeight = 10.0;
+                    if (summaryColor != null)
+                    {
+                        cell.BackgroundColor = summaryColor;
+                    }
                 }
 
                 transaction.Commit();
@@ -801,7 +830,8 @@ namespace AreaManager.Services
             {
                 return new TotalsColumnMap
                 {
-                    TotalAreaColumn = 5,
+                    TotalAreaColumn = 4,
+                    WithinDispositionColumn = 5,
                     DashColumn = 6,
                     ExistingCutColumn = 7,
                     NewCutColumn = 8
@@ -812,7 +842,8 @@ namespace AreaManager.Services
             {
                 return new TotalsColumnMap
                 {
-                    TotalAreaColumn = 5,
+                    TotalAreaColumn = 4,
+                    WithinDispositionColumn = 5,
                     DashColumn = -1,
                     ExistingCutColumn = 6,
                     NewCutColumn = 7
@@ -822,6 +853,7 @@ namespace AreaManager.Services
             return new TotalsColumnMap
             {
                 TotalAreaColumn = -1,
+                WithinDispositionColumn = -1,
                 DashColumn = -1,
                 ExistingCutColumn = -1,
                 NewCutColumn = -1
@@ -840,6 +872,7 @@ namespace AreaManager.Services
         private class TotalsColumnMap
         {
             public int TotalAreaColumn { get; set; }
+            public int WithinDispositionColumn { get; set; }
             public int DashColumn { get; set; }
             public int ExistingCutColumn { get; set; }
             public int NewCutColumn { get; set; }
