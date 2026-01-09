@@ -25,5 +25,10 @@ namespace AreaManager.UI
         {
             WorkspaceObjectDataService.AddObjectDataToShapes();
         }
+
+        private void addRtfInfoButton_Click(object sender, EventArgs e)
+        {
+            GenerationService.AddRtfInfoToTemporaryAreasTable();
+        }
     }
 }
