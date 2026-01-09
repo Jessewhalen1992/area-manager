@@ -5,6 +5,7 @@ using System.Linq;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.AutoCAD.DatabaseServices;
 using Autodesk.AutoCAD.EditorInput;
+using Autodesk.AutoCAD.GraphicsInterface;
 using AreaManager.Models;
 using Autodesk.AutoCAD.Geometry;
 using Autodesk.Gis.Map;
@@ -184,12 +185,14 @@ namespace AreaManager.Services
                         Autodesk.AutoCAD.Colors.ColorMethod.ByAci,
                         colorIndexes.Min())
                     : null;
+                var boldStyleId = GetOrCreateBoldTextStyle(transaction, database, table.Cells[insertIndex, 0].TextStyleId);
 
                 for (int col = 0; col < table.Columns.Count; col++)
                 {
                     var cell = table.Cells[insertIndex, col];
                     cell.Alignment = CellAlignment.MiddleCenter;
                     cell.TextHeight = 10.0;
+                    cell.TextStyleId = boldStyleId;
                     if (summaryColor != null)
                     {
                         cell.BackgroundColor = summaryColor;
@@ -234,6 +237,42 @@ namespace AreaManager.Services
             }
 
             InsertTable(database, editor, tempRows);
+        }
+
+        private static ObjectId GetOrCreateBoldTextStyle(Transaction transaction, Database database, ObjectId baseStyleId)
+        {
+            var textStyleTable = (TextStyleTable)transaction.GetObject(database.TextStyleTableId, OpenMode.ForRead);
+            var baseStyle = (TextStyleTableRecord)transaction.GetObject(baseStyleId, OpenMode.ForRead);
+            var boldStyleName = $"{baseStyle.Name}_AreaManagerBold";
+
+            if (textStyleTable.Has(boldStyleName))
+            {
+                return textStyleTable[boldStyleName];
+            }
+
+            textStyleTable.UpgradeOpen();
+
+            var baseFont = baseStyle.Font;
+            var boldStyle = new TextStyleTableRecord
+            {
+                Name = boldStyleName,
+                FileName = baseStyle.FileName,
+                BigFontFileName = baseStyle.BigFontFileName,
+                TextSize = baseStyle.TextSize,
+                XScale = baseStyle.XScale,
+                ObliquingAngle = baseStyle.ObliquingAngle,
+                FlagBits = baseStyle.FlagBits,
+                Font = new FontDescriptor(
+                    baseFont.TypeFace,
+                    true,
+                    baseFont.Italic,
+                    baseFont.CharacterSet,
+                    baseFont.PitchAndFamily)
+            };
+
+            var boldStyleId = textStyleTable.Add(boldStyle);
+            transaction.AddNewlyCreatedDBObject(boldStyle, true);
+            return boldStyleId;
         }
 
         public static void GenerateWorkspaceAreasTable()
