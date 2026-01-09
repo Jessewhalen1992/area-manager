@@ -1082,15 +1082,17 @@ namespace AreaManager.Services
                             }
                         }
 
-                        // Use boundary shape area (if available) for totals so we don't depend on the block text math.
-                        var totalAreaHa = boundaryAreaHa > 0.0
-                            ? boundaryAreaHa
-                            : TextParsingService.ParseDoubleOrDefault(row.AreaHa);
+                        // Use the block text math (length x width) for totals.
+                        var totalAreaHa = TextParsingService.ParseDoubleOrDefault(row.AreaHa);
 
-                        // Keep the displayed "Area" in sync with what we actually used for totals.
-                        if (boundaryAreaHa > 0.0)
+                        if (boundaryAreaHa > 0.0 && AreasMatch(existingCutDisturbanceHa, boundaryAreaHa))
                         {
-                            row.AreaHa = boundaryAreaHa.ToString("0.000", CultureInfo.InvariantCulture);
+                            existingCutDisturbanceHa = totalAreaHa;
+                        }
+
+                        if (boundaryAreaHa > 0.0 && AreasMatch(withinDispositionHa, boundaryAreaHa))
+                        {
+                            withinDispositionHa = totalAreaHa;
                         }
 
                         var newCutHa = totalAreaHa - existingCutDisturbanceHa;
@@ -1101,7 +1103,7 @@ namespace AreaManager.Services
 
                         // WITHIN DISPOSITION display rules:
                         // - 0.000 => "No"
-                        // - matches the boundary shape area (3dp) => "Yes"
+                        // - matches the math area (3dp) => "Yes"
                         // - otherwise show the area (3dp)
                         var withinText = withinDispositionHa.ToString("0.000", CultureInfo.InvariantCulture);
                         if (withinText == "0.000")
@@ -1110,12 +1112,10 @@ namespace AreaManager.Services
                         }
                         else
                         {
-                            var boundaryText = boundaryAreaHa > 0.0
-                                ? boundaryAreaHa.ToString("0.000", CultureInfo.InvariantCulture)
-                                : null;
+                            var totalText = totalAreaHa.ToString("0.000", CultureInfo.InvariantCulture);
 
                             row.WithinExistingDisposition =
-                                !string.IsNullOrEmpty(boundaryText) && withinText == boundaryText
+                                withinText == totalText
                                     ? "Yes"
                                     : withinText;
                         }
@@ -1156,6 +1156,11 @@ namespace AreaManager.Services
             {
                 return false;
             }
+        }
+
+        private static bool AreasMatch(double left, double right)
+        {
+            return Math.Abs(left - right) < 0.0005;
         }
 
         private static Region CreateRegionFromEntity(Entity entity)
