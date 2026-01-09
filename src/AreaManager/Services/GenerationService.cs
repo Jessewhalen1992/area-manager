@@ -185,7 +185,13 @@ namespace AreaManager.Services
                         Autodesk.AutoCAD.Colors.ColorMethod.ByAci,
                         colorIndexes.Min())
                     : null;
-                var boldStyleId = GetOrCreateBoldTextStyle(transaction, database, table.Cells[insertIndex, 0].TextStyleId);
+                var baseStyleId = table.Cells[insertIndex, 0].TextStyleId ?? database.Textstyle;
+                if (baseStyleId == ObjectId.Null)
+                {
+                    baseStyleId = database.Textstyle;
+                }
+
+                var boldStyleId = GetOrCreateBoldTextStyle(transaction, database, baseStyleId);
 
                 for (int col = 0; col < table.Columns.Count; col++)
                 {
